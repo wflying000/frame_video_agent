@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=1280,height=720">
+<style>html,body{margin:0;background:#080e20;overflow:hidden}canvas{display:block}</style>
+<canvas id="stage" width="1280" height="720"></canvas>
+<script>
+// Hand-authored offline example; the agent generates a different page for each input.
+const c=document.getElementById('stage'), g=c.getContext('2d');
+const clamp=x=>Math.max(0,Math.min(1,x)), ease=x=>{x=clamp(x);return x*x*(3-2*x)};
+const mix=(a,b,p)=>a+(b-a)*p;
+const color=(a,b,p)=>`rgb(${a.map((v,i)=>Math.round(mix(v,b[i],p))).join(',')})`;
+function line(points,stroke,width){g.beginPath();points.forEach(([x,y],i)=>i?g.lineTo(x,y):g.moveTo(x,y));g.strokeStyle=stroke;g.lineWidth=width;g.lineCap='round';g.lineJoin='round';g.stroke()}
+function oval(x,y,rx,ry,fill){g.beginPath();g.ellipse(x,y,rx,ry,0,0,Math.PI*2);g.fillStyle=fill;g.fill()}
+function box(x,y,w,h,r,fill){g.beginPath();g.roundRect(x,y,w,h,r);g.fillStyle=fill;g.fill()}
+function cloud(x,y,s){g.save();g.translate(x,y);g.scale(s,s);oval(0,0,65,17,'#fff5da');oval(-25,-14,28,22,'#fff5da');oval(16,-23,33,29,'#fff5da');g.restore()}
+const pulls=[4.2,7.3,10,11,12,13,14,15,16], brokenAt=16.38;
+window.film={duration:20,frame(t){
+  t=Math.max(0,Math.min(20,t)); g.resetTransform();g.globalAlpha=1;g.clearRect(0,0,1280,720);
+  let daylight=1, count=0;
+  for(const start of pulls){const q=ease((t-start-.32)/.16);if(q>0){daylight=mix(count%2?0:1,count%2?1:0,q);count++}}
+  const broken=t>=brokenAt;
+  if(broken)daylight=0;
+  const sky=g.createLinearGradient(0,0,0,620);
+  sky.addColorStop(0,color([7,13,35],[89,177,211],daylight));
+  sky.addColorStop(1,color([29,40,67],[248,224,166],daylight));g.fillStyle=sky;g.fillRect(0,0,1280,720);
+  g.globalAlpha=1-daylight;
+  for(let i=0;i<64;i++){const x=(i*197+41)%1280,y=(i*83+29)%385;oval(x,y,i%5===0?2:1,i%5===0?2:1,'#e6edff')}
+  oval(1050,122,42,42,'#e3e7d5');oval(1068,107,38,38,'#101b36');
+  g.globalAlpha=daylight;oval(1050,122,48,48,'#fff2b8');cloud(220+9*Math.sin(t*.1),127,1.1);cloud(480,206,.65);g.globalAlpha=1;
+  // Distant buildings and a wide plaza keep the light change visible across the world.
+  for(let i=0;i<13;i++){
+    let x=i*110-30,h=75+(i*37)%115;
+    g.fillStyle=color([21,31,48],[150,174,164],daylight);g.fillRect(x,510-h,85,h);
+    g.fillStyle=broken?'#172238':color([229,193,119],[223,220,184],daylight);
+    for(let j=0;j<3;j++)for(let k=0;k<3;k++)g.fillRect(x+14+j*22,526-h+k*27,9,13);
+  }
+  g.fillStyle=color([13,23,36],[116,155,129],daylight);g.fillRect(0,510,1280,210);
+  g.fillStyle=color([22,32,44],[214,207,176],daylight);g.beginPath();g.moveTo(250,720);g.lineTo(590,510);g.lineTo(815,510);g.lineTo(1210,720);g.fill();
+  line([[0,614],[1280,614]],color([21,32,46],[174,186,150],daylight),2);
+  // A celestial switch makes the rope's cause and effect readable without captions.
+  const switchFill=broken?'#243043':color([119,137,167],[255,245,207],daylight);
+  box(714,68,92,77,18,'#0d20304d');box(718,62,84,77,15,switchFill);
+  box(739,76,42,47,8,broken?'#111a2b':'#38495b');
+  g.save();g.translate(760,100);g.rotate(broken?.35:mix(.24,-.24,daylight));box(-13,-16,26,32,5,broken?'#596373':'#f3c67a');g.restore();
+  if(broken){line([[738,66],[752,85],[742,96],[766,116],[758,137]],'#101723',4)}
+  let pull=0;
+  for(const start of [...pulls,17.45,18.55,19.35]){
+    const u=(t-start)/.82;
+    if(u>0&&u<1)pull=Math.max(pull,Math.sin(Math.PI*u)**2);
+  }
+  const walk=ease(t/3.4), excited=t>8&&t<brokenAt;
+  const px=mix(350,700,walk), bounce=excited?-Math.abs(Math.sin(t*7))*5:0;
+  const ropeY=393+pull*54, reached=t>3.15;
+  // Rope always returns to the same length for the same time.
+  line([[760,139],[760,ropeY]],broken?'#a49a7c':'#ead9a6',7);
+  line([[758,142],[758,ropeY]],broken?'#655f52':'#af9564',2);
+  oval(760,ropeY,8,9,broken?'#8f8775':'#efd89c');
+  if(broken){
+    const spark=clamp(1-(t-brokenAt)/.9);
+    g.globalAlpha=spark;
+    for(let i=0;i<9;i++){const a=i*Math.PI*2/9,rad=20+(1-spark)*75;line([[760+Math.cos(a)*rad,102+Math.sin(a)*rad],[760+Math.cos(a)*(rad+12),102+Math.sin(a)*(rad+12)]],'#ffd78d',3)}
+    g.globalAlpha=1;
+  }
+  oval(px,610,64,12,color([4,10,20],[117,132,112],daylight));
+  g.save();g.translate(px,bounce);
+  const stride=t<3.4?Math.sin(t*8)*16:0;
+  line([[-14,531],[-21+stride,574],[-24+stride,604]],'#2f4356',19);
+  line([[14,531],[23-stride,574],[28-stride,604]],'#354f64',19);
+  line([[-33+stride,607],[-15+stride,607]],'#172c3b',13);
+  line([[20-stride,607],[43-stride,607]],'#172c3b',13);
+  box(-29,452,58,88,17,'#d7884f');line([[-18,459],[-16,529]],'#edb37c',4);
+  line([[0,440],[0,459]],'#e8b588',16);
+  oval(0,418,28,33,'#f0c298');oval(-26,422,6,9,'#e2aa7d');oval(26,422,6,9,'#e2aa7d');
+  g.fillStyle='#3c2d2c';g.beginPath();g.arc(0,411,29,Math.PI,Math.PI*2);g.lineTo(25,418);g.lineTo(14,402);g.lineTo(-14,403);g.lineTo(-25,421);g.fill();
+  const gaze=t<3.4?5:2;
+  oval(-9+gaze,416,2.4,3.3,'#28313c');oval(9+gaze,416,2.4,3.3,'#28313c');
+  if(excited){g.strokeStyle='#843d36';g.lineWidth=2.8;g.beginPath();g.arc(3,426,10,0,Math.PI);g.stroke()}
+  else if(broken){oval(2,433,4,5,'#843d36');line([[-14,406],[-5,410]],'#604239',2);line([[8,410],[16,405]],'#604239',2)}
+  else{line([[-3,433],[8,433]],'#a06754',2)}
+  // Left arm expresses discovery and excitement; right arm stays attached to the rope.
+  const leftY=excited?451:505;
+  line([[-24,465],[-44,491],[-53,leftY]],'#d7884f',16);oval(-53,leftY,8,9,'#f0c298');
+  if(reached){line([[23,464],[47,455+pull*8],[760-px,ropeY-bounce]],'#d7884f',16);oval(760-px,ropeY-bounce,9,10,'#f0c298')}
+  else{line([[23,464],[40,483],[49,464-18*walk]],'#d7884f',16);oval(49,464-18*walk,8,9,'#f0c298')}
+  g.restore();
+  // Following the break, the entire scene dims while the unsuccessful pulls remain visible.
+  if(broken){g.fillStyle=`rgba(0,3,13,${.45*ease((t-brokenAt)/1.5)})`;g.fillRect(0,0,1280,720)}
+  const vignette=g.createRadialGradient(640,340,210,640,340,760);vignette.addColorStop(0,'#00000000');vignette.addColorStop(1,'#050b2638');g.fillStyle=vignette;g.fillRect(0,0,1280,720);
+}};
+window.film.frame(0);
+</script></html>

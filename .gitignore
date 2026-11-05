@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local secrets, OS metadata and generated video projects
+.env.*
+!.env.example
+.DS_Store
+/output/
+/outputs/
+/sea_video/
