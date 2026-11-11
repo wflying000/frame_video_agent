@@ -208,6 +208,11 @@ def shot(project, spec, frames, references, previous_shot=None, next_shot=None):
                     '下一镜头尚未绘制，不能因缺少其实际图片判失败，也不能声称见到了其画面。'
                     'next_shot_entry 用于核对身份和动作状态；若两镜头 camera 不同，'
                     '不能强制其屏幕坐标与当前末帧完全相同，本镜头自身的 exit_state 仍须满足。'
+                    '动作发生时段以已审核frame_plan的intervals和keyframes为准：'
+                    '逐项比较动作区间内的真实帧，不能因为首尾为静止姿态就推断中间没有动作，'
+                    '也不能要求计划中的进入、保持或落定阶段持续保持中间运动姿态。'
+                    '仍须完整验证所有运动区间、实际位移和动作结果；要求全程成立的连接或身份'
+                    '在任何采样帧不满足时仍必须失败。'
                     '两侧实际像素的衔接由所有镜头生成后的 checks/timeline 独立审核，'
                     '任何边界未通过都不能发布 final.mp4。'},
                refs + image_inputs(images), [i for i, _ in images])

@@ -4,6 +4,44 @@
 
 默认视频规格为 **20 秒、24 fps、1280×720、H.264 MP4、无音轨**。当前使用程序化 Canvas 绘制，没有接入图像生成模型、配音或字幕轨道。
 
+## 示例视频
+
+以下四段视频均经过本项目的生成与最终验收流程。README 中显示的是缩小后的 GIF 动态预览；点击预览图或「完整 MP4」可打开原始 **1280×720、24 fps、无音轨** 视频。
+
+| 机械海底世界 · 20 秒 | 小云的彩虹喷嚏 · 6 秒 |
+| --- | --- |
+| [![机械海底世界动态预览](docs/showcase/sea_world.gif)](docs/showcase/sea_world.mp4) | [![小云的彩虹喷嚏动态预览](docs/showcase/cloud_sneeze.gif)](docs/showcase/cloud_sneeze.mp4) |
+| 旧工具、链条和金属零件拼成机械鱼，在幽暗海底游动。 | 小云打了个喷嚏，竟然喷出一道红、黄、蓝三色彩虹。 |
+| [完整 MP4](docs/showcase/sea_world.mp4) · [故事原文](story_sea.txt) | [完整 MP4](docs/showcase/cloud_sneeze.mp4) · [故事原文](examples/stories/cloud_sneeze.txt) |
+
+| 气球送星星回家 · 6 秒 | 饼干越狱 · 6 秒 |
+| --- | --- |
+| [![气球送星星回家动态预览](docs/showcase/balloon_star.gif)](docs/showcase/balloon_star.mp4) | [![饼干越狱动态预览](docs/showcase/cookie_escape.gif)](docs/showcase/cookie_escape.mp4) |
+| 红气球牵着小星星升向夜空，小星星停下来眨了眨眼。 | 长出小短腿的巧克力豆饼干，踮脚远离罐子，停下来得意地笑了。 |
+| [完整 MP4](docs/showcase/balloon_star.mp4) · [故事原文](examples/stories/balloon_star.txt) | [完整 MP4](docs/showcase/cookie_escape.mp4) · [故事原文](examples/stories/cookie_escape.txt) |
+
+海底视频来自已有的 `sea_video/final.mp4`，展示副本与原成片的 SHA-256 一致。三个新故事保存在 `examples/stories/`；视频规格、来源与验收状态记录在 [`docs/showcase/provenance.json`](docs/showcase/provenance.json)。
+
+<details>
+<summary>复现三个新故事的生成命令</summary>
+
+先按下文安装环境并配置 `.env`，再在项目根目录执行：
+
+```bash
+conda activate vagent
+
+for story in cloud_sneeze balloon_star cookie_escape; do
+  LLM_EXTRA_BODY='{"thinking":{"type":"disabled"},"max_tokens":32768}' \
+  python -m agent generate "examples/stories/${story}.txt" \
+    --out "outputs/showcase/${story}" --seconds 6 --fps 24 \
+    --max-calls 120 --max-seconds 3600
+done
+```
+
+上述模型参数是本次新示例使用的运行配置，不改写根目录 `.env`；其他服务请按实际支持情况调整。新输出目录须为空，暂停后对同一故事使用原参数追加 `--resume`。本次示例的部分镜头经局部代码修复并提高对应候选上限后重新通过审核，记录见 `provenance.json`。模型输出和修复次数可能随运行变化，复现不保证画面逐像素相同。
+
+</details>
+
 ## 1. 环境配置
 
 以下命令在项目根目录执行，使用 Bash / Zsh。已克隆项目时直接进入现有目录，无需再次克隆。
@@ -208,6 +246,8 @@ python -m agent generate examples/story.txt \
 
 边界审核从两段实际编码视频各取紧贴切点的三张连续帧，并记录切点与邻帧的像素变化量。新增动作相位检查，不能把机位描述变化当作身体形变、头部伸出、尾部相位归零或背景突然消失的通用理由；变化量只是定位线索，仍需按真实画面审核。边界修复会获得上一镜头的实际 HTML、最后帧时间和下一采样时间，以连续动作参数承接局部 `t=0`，禁止用两幅身体交叉淡化掩盖跳变。旧版边界审核需复验；镜头历史和旧成片保留。
 
+边界审核同时接收两侧已审核的帧计划与实际采样的局部帧号，只判断切点邻域当时应有的动作状态；不会要求计划稍后发生的动作提前在首三帧完成。当前时刻应有的道具、连接与姿态仍需通过真实画面检查，完整动作继续由镜头时序和成片事件审核验证。
+
 明确定位到代码问题时，修复请求也可携带 `local_patch`（项目内补丁路径、补丁哈希与源 HTML 哈希），应用人工编写的精确片段替换。源版本或补丁内容改变就拒绝应用；新候选记录 `applied_local_patch.json`，不伪装成模型输出，不消耗生成调用，但仍须完成全部逐帧、时序、边界和成片审核。候选次数和审核调用照常计入预算。
 
 若自动细化的首帧要求与连续衔接冲突，可针对明确的候选版本提交 `scope: plan` 与 `replan_source_version`。重规划参考真实失败帧和上一镜头末帧，仍独立审查原分镜全部硬要求；之后先用新计划完整审核现有代码，确实不满足时才进入代码修复。该请求只作用于指定源版本，不在后续失败候选中无限重新规划。
@@ -339,6 +379,6 @@ python -m unittest discover -s tests -v
 | 候选次数或调用预算耗尽 | 先检查失败原因，再用第 3、5 节的预算或候选上限参数续跑 |
 | 没有 `final.mp4` | 检查 `manifest.json` 是否为 `COMPLETED`；审核未通过或预算不足时状态为 `BLOCKED`，不会发布未验收成片 |
 
-建议将新产物统一放在 `outputs/`。`.gitignore` 排除了 `.env`、本地环境、缓存、`output/`、`outputs/` 和现有 `sea_video/`；历史视频及诊断留在本机，仓库保存源码、测试、示例和配置模板。使用其他输出目录时，请自行添加对应的忽略规则。
+建议将新产物统一放在 `outputs/`。`.gitignore` 排除了 `.env`、本地环境、缓存、`output/`、`outputs/` 和现有 `sea_video/`；生成过程的历史版本及诊断留在本机，仓库保存源码、测试、故事和配置模板；已验收的展示视频与 GIF 单独保存在 `docs/showcase/`。使用其他输出目录时，请自行添加对应的忽略规则。
 
 当前局部修复以镜头代码为单位，可能影响整个镜头，因此每次修复都需重新验收。视觉审核使用带帧号的有序图片，仍可能漏掉短暂细节，交付前应观看完整视频。

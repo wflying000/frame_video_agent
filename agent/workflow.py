@@ -73,19 +73,32 @@ def check_boundaries(project, board, shots):
                     req('MOTION_PHASE', '连续动作在边界承接前帧的部件姿态、形变和运动相位；'
                         '不得因新镜头局部时间归零而出现头部回缩、身体突然伸直、尾部跳位或背景无故消失')],
                    {'left_shot': board['shots'][i - 1], 'right_shot': board['shots'][i],
-                    'continuity_review_version': 2,
+                    'continuity_review_version': 3,
                     'boundary_frames': [left['end_frame'] - 1, right['start_frame']],
                     'decoded_frame_changes': changes,
+                    'boundary_phase_context': {
+                        'left': {'sampled_local_frames': [index for index, _ in left_frames],
+                                 'global_start_frame': left['start_frame'],
+                                 'frame_plan': left['frame_plan']},
+                        'right': {'sampled_local_frames': [index for index, _ in right_frames],
+                                  'global_start_frame': right['start_frame'],
+                                  'frame_plan': right['frame_plan']}},
                     'verification_scope': '先核对两侧分镜的 camera。若计划明确切换视角或景别，'
                         '屏幕坐标、尺寸和所见正背面可随机位变化，不能仅凭这些差异判角色转身跳变，'
                         '也不要求切镜之间存在单镜头式的转身动画。仍须核对剧情中的空间关系、'
                         '角色身份、物体开闭和动作结果；机位变化不能解释的道具状态改变必须失败。'
                         '机位描述不同不能自动豁免动作状态连续性；应明确区分合理投影变化与部件相位重置。'
                         '逐帧核对 boundary_frames 以及其前后连续帧，证据必须解释切点实际变化。'
-                        '画面不足以判断时用 UNCERTAIN，不按预设结论补全证据。'},
+                        'boundary_phase_context 给出已审核的局部帧计划及实际采样范围；'
+                        '先将全局帧号换算为对应镜头局部帧号，再按该时刻应有的状态核对。'
+                        '只判断所提供切点邻域内的连续性，不能要求计划稍后发生的动作或道具'
+                        '提前出现在新镜头首三帧，也不能据此声称整段镜头漏掉动作。'
+                        '后续完整动作仍由该镜头时序审核和成片事件审核验证；'
+                        '若当前时刻已经应当出现的动作、连接关系或道具缺失，仍必须失败。'
+                        '画面不足以判断边界连续性时用 UNCERTAIN，不按预设结论补全证据。'},
                    drawing.image_inputs(images), [frame for frame, _ in images])
         return {'status': 'PASS', 'boundaries': max(0, len(shots) - 1)}
-    return project.task('checks/timeline', {'storyboard': board, 'continuity_review_version': 2}, deps, action,
+    return project.task('checks/timeline', {'storyboard': board, 'continuity_review_version': 3}, deps, action,
                         max_attempts=3, retry=False)
 
 

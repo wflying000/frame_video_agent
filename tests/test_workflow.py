@@ -605,6 +605,13 @@ class WorkflowTests(unittest.TestCase):
             boundary = next(payload for _, payload in fake.calls if payload.get('target_id') == 'S01_S02')
             self.assertEqual(boundary['boundary_frames'], [3, 4])
             self.assertEqual(boundary['required_check_ids'], ['CONTINUITY', 'MOTION_PHASE'])
+            phase = boundary['boundary_phase_context']
+            self.assertEqual(phase['left']['sampled_local_frames'], [1, 2, 3])
+            self.assertEqual(phase['right']['sampled_local_frames'], [0, 1, 2])
+            self.assertEqual(phase['right']['global_start_frame'], 4)
+            # 右镜头的末态尚不在边界采样中，仍须携带完整计划供审核区分后续动作。
+            self.assertEqual(phase['right']['frame_plan']['keyframes'][-1]['frame_index'], 3)
+            self.assertNotIn(3, phase['right']['sampled_local_frames'])
             self.assertEqual([row['frame_index'] for row in read_json(
                 self.root / 'checks/timeline/v001/boundary_1_frames/left/preview_manifest.json')], [1, 2, 3])
             self.assertEqual([row['frame_index'] for row in read_json(
