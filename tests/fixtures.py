@@ -77,6 +77,8 @@ class FakeModel:
                 indices.append(int(row['text'].split('=')[1]))
         report = {'target_id': target, 'target_version': version, 'status': status,
                   'checks': [{'requirement_id': r['id'], 'result': status, 'evidence': '实际画面证据',
-                              'evidence_frames': indices[:1]} for r in payload['requirements']],
+                              'evidence_frames': (payload.get('visual_depth_frame_indices', indices)[:2]
+                                                  if r['id'] in payload.get('visual_depth_check_ids', [])
+                                                  else indices[:1])} for r in payload['requirements']],
                   'repair': {'scope': 'shot', 'shot_ids': ['S02'], 'instruction': '修正球的位置'}}
         return report

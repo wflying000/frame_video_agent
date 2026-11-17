@@ -6,6 +6,21 @@ Turn a UTF-8 story into an animated video through story analysis, storyboarding,
 
 The default output is **20 seconds, 24 fps, 1280×720, H.264 MP4, without audio**. The current rendering backend uses procedural Canvas animation; image generation models, voiceovers, and subtitle tracks are not integrated.
 
+## Visual Requirements: Volume and Spatial Depth
+
+Generated videos must convey **solid forms and spatial depth with a hand-drawn or illustrated look**. Canvas 2D is the drawing backend; flat color fills, icon-like shapes, and paper-cutout visuals do not meet the requirement. The intended look is also distinct from 3D modeling, photorealistic CG, or plastic-toy rendering.
+
+- Shape subjects with coherent lighting, light-to-shadow transitions that follow their surfaces, material-appropriate highlights, and plausible contact shadows where applicable. A drop shadow or background gradient alone is insufficient.
+- Establish depth with at least two complementary cues suited to the shot: overlap, perspective or foreshortening, relative scale, contact planes, or distance-dependent contrast and detail. Close-ups may use the subject's own overlapping forms; do not invent props or events to fill the background.
+- Keep lighting, volume, occlusion, and shadows coherent during movement. Use parallax only when the camera or subjects actually move relative to the scene.
+- Isolated character and prop references may have clean backgrounds, but must still show volume. Lighting and texture must keep identities, actions, and contact points readable.
+
+These are default **hard review requirements**, added by the application even if the model omits them from its plan. They apply to visual and frame planning, asset references, keyframes, temporal reviews, and per-shot reviews of the encoded final video. Failed or uncertain checks trigger the existing bounded repair process; they cannot be waived with `NOT_APPLICABLE`. Final appearance reports are stored in `exports/final/vNNN/appearance_<shot-id>.json` and `appearance_evidence.json`. Visual judgment still depends on the reviewing model; watch the complete result before delivery.
+
+Explicitly planned black transitions retain their original state and technical checks; they are exempt from appearance checks and cannot serve as depth evidence for visible scenes. Temporal appearance checks require multiple actual non-black frames when available. Final appearance failures are bound to the shot being reviewed, with the model's original report preserved.
+
+Generation commands are unchanged. Use a new output directory to regenerate a story under these rules. On `--resume`, changed prompts invalidate old task approvals and preserve version history and cumulative budgets; a stale published video is archived under `exports/previous_final_*.mp4`. Existing showcase files below were generated before this requirement and have not been regenerated or certified against it.
+
 ## Video Showcase
 
 All four videos below completed this project's generation and final acceptance workflow. The README displays smaller animated GIF previews. Click a preview or **Full MP4** to open the original **1280×720, 24 fps video without audio**.

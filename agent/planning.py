@@ -10,6 +10,53 @@ def req(key, text):
     return {'id': key, 'hard': True, 'text': text}
 
 
+def depth_requirements(requirements, scope):
+    """追加程序持有的美术硬门槛，不依赖生成器自行列出，也不覆盖原检查项。"""
+    validation.require(scope in {'plan', 'reference', 'frame', 'temporal'}, '未知体积与纵深审核范围')
+    result = list(requirements)
+    used = {item['id'] for item in result}
+    groups = ['base', 'reference' if scope == 'reference' else 'scene']
+    if scope == 'temporal':
+        groups.append('temporal')
+    for group in groups:
+        for key, text in prompts.DEPTH_CHECKS[group].items():
+            # 模型若恰好使用同名 ID，也保留它的原要求；程序规则仍独立审核。
+            check_id = key
+            while check_id in used:
+                check_id += '_POLICY'
+            used.add(check_id)
+            result.append(req(check_id, text))
+    return result
+
+
+def depth_frame_indices(frame_ids, allowed_black_ranges):
+    """已声明的黑屏转场不能充当物体体积或空间纵深的证据。"""
+    return [frame for frame in frame_ids
+            if not any(start <= frame < end for start, end in allowed_black_ranges)]
+
+
+def validate_review_evidence(report, frame_ids, context):
+    """新审核与跨候选复用使用同一证据门槛，格式失败不能在恢复时变成 PASS。"""
+    available = set(frame_ids)
+    for row in report['checks']:
+        if row['result'] != 'PASS':
+            continue
+        evidence = row.get('evidence_frames')
+        validation.require(isinstance(evidence, list) and evidence and
+                           all(type(i) is int and i in available for i in evidence),
+                           '视觉审核 PASS 必须引用实际提供的帧号')
+        if row['requirement_id'] in context.get('visual_depth_check_ids', []):
+            depth_frames = context['visual_depth_frame_indices']
+            validation.require(set(evidence) <= set(depth_frames),
+                               '体积与纵深 PASS 不能引用黑屏转场作为证据')
+            if context.get('visual_scope') == 'frame':
+                validation.require(context['task']['frame_index'] in evidence,
+                                   '关键帧体积与纵深 PASS 必须引用当前帧')
+            if row['requirement_id'].startswith('DEPTH_STABILITY'):
+                validation.require(len(set(evidence)) >= min(2, len(depth_frames)),
+                                   '光影与体积稳定性 PASS 必须比较实际非黑屏帧')
+
+
 def reuse_review(project, directory, name, messages, target, version, requirements, frame_ids):
     """只复用相同要求、真实像素与配置的 PASS，显式绑定原审核证据。"""
     def signature(recorded):
@@ -19,6 +66,7 @@ def reuse_review(project, directory, name, messages, target, version, requiremen
         recorded[1]['content'][0]['text'] = json.dumps(context, ensure_ascii=False, sort_keys=True)
         return digest(recorded)
     recorded = model.recorded_messages(messages)
+    evidence_context = json.loads(recorded[1]['content'][0]['text'])
     expected, settings = signature(recorded), model.settings()
     for prior_dir in sorted(directory.parent.glob('v*'), reverse=True):
         if prior_dir == directory:
@@ -58,11 +106,11 @@ def reuse_review(project, directory, name, messages, target, version, requiremen
                                 'sha256': file_hash(resolution)}
         if report.get('status') != 'PASS':
             continue
-        if not validation.review(report, target, report['target_version'], requirements):
-            continue
-        if any(not isinstance(check.get('evidence_frames'), list) or not check['evidence_frames'] or
-               any(type(i) is not int or i not in frame_ids for i in check['evidence_frames'])
-               for check in report['checks'] if check['result'] == 'PASS'):
+        try:
+            if not validation.review(report, target, report['target_version'], requirements):
+                continue
+            validate_review_evidence(report, frame_ids, evidence_context)
+        except (ValueError, KeyError, TypeError):
             continue
         result = dict(report, target_version=version, reused_from={
             'path': str(source.resolve().relative_to(project.root)), 'sha256': file_hash(source),
@@ -78,7 +126,33 @@ def reuse_review(project, directory, name, messages, target, version, requiremen
         return result
 
 
-def review(project, directory, name, target, version, requirements, payload, images=(), frame_ids=None, mode=None):
+def review(project, directory, name, target, version, requirements, payload, images=(), frame_ids=None,
+           mode=None, visual_scope=None):
+    depth_frames = None
+    if visual_scope is not None and frame_ids is not None:
+        black_ranges = payload.get('allowed_black_ranges', payload.get('frame_plan', {}).get('allowed_black_ranges', []))
+        depth_frames = depth_frame_indices(frame_ids, black_ranges)
+        current = payload.get('task', {}).get('frame_index')
+        if visual_scope == 'frame' and current in frame_ids and current not in depth_frames:
+            # 只豁免已声明的黑屏当前帧；原状态检查和其他实际画面的美术门槛仍保留。
+            payload = dict(payload, visual_depth_exemption={
+                'reason': 'declared_black_transition', 'frame_index': current})
+            visual_scope = None
+        elif visual_scope == 'temporal' and not depth_frames:
+            intervals = payload.get('frame_plan', {}).get('intervals', [])
+            if intervals and not depth_frame_indices(
+                    range(intervals[0]['start_frame'], intervals[-1]['end_frame']), black_ranges):
+                payload = dict(payload, visual_depth_exemption={
+                    'reason': 'declared_black_transition', 'frame_indices': list(frame_ids)})
+                visual_scope = None
+    if visual_scope is not None:
+        original_count = len(requirements)
+        requirements = depth_requirements(requirements, visual_scope)
+        payload = dict(payload, visual_scope=visual_scope,
+                       visual_depth_check_ids=[item['id'] for item in requirements[original_count:]])
+        if depth_frames is not None:
+            validation.require(depth_frames, '体积与纵深审核必须有非黑屏的实际画面证据')
+            payload['visual_depth_frame_indices'] = depth_frames
     context = dict(payload, target_id=target, target_version=version, requirements=requirements,
                    required_check_ids=[r['id'] for r in requirements],
                    evidence_mode=mode or ('pixels' if images else 'plan'))
@@ -168,13 +242,7 @@ def checked_review(project, directory, name, target, version, requirements, cont
         try:
             passed = validation.review(report, target, version, requirements)
             if frame_ids is not None:
-                available = set(frame_ids)
-                for row in report['checks']:
-                    if row['result'] == 'PASS':
-                        evidence = row.get('evidence_frames')
-                        validation.require(isinstance(evidence, list) and evidence and
-                                           all(type(i) is int and i in available for i in evidence),
-                                           '视觉审核 PASS 必须引用实际提供的帧号')
+                validate_review_evidence(report, frame_ids, context)
         except (ValueError, KeyError, TypeError) as error:
             if attempt:
                 raise
@@ -231,7 +299,7 @@ def prepare_frame_plan(directory, value):
 
 
 def plan_stage(project, task_id, deps, system, payload, validate, requirements, prepare=None,
-               generation_context=None):
+               generation_context=None, visual_scope=None):
     def action(directory, version, previous):
         context = dict(payload, **prior(project, previous))
         if generation_context:
@@ -241,7 +309,7 @@ def plan_stage(project, task_id, deps, system, payload, validate, requirements, 
             value = prepare(directory, value)
         validate(value)
         review(project, directory, 'review', task_id, version, requirements,
-               {'source': payload, 'candidate': value})
+               {'source': payload, 'candidate': value}, visual_scope=visual_scope)
         return value
     return project.task(task_id, payload, deps, action)
 
@@ -258,14 +326,16 @@ def plan(project):
         {'event_id': e['event_id'], 'before': e['precondition'], 'after': e['result']} for e in facts['events']])
     visual = plan_stage(project, 'plans/visual', ['plans/story'], prompts.VISUAL,
                         {'story': facts}, lambda value: validation.visual(value, facts),
-                        [req('VISUAL', '全部实体的固定造型与可变状态清楚，一致且不与原文冲突')])
+                        [req('VISUAL', '全部实体的固定造型与可变状态清楚，一致且不与原文冲突')],
+                        visual_scope='plan')
     write_json(project.root / 'plans/visual_bible.json', visual)
     board = plan_stage(project, 'plans/storyboard', ['plans/story', 'plans/visual'], prompts.STORYBOARD,
                        {'story': facts, 'visual': visual, 'total_frames': config['seconds'] * config['fps'],
                         'fps': config['fps']},
                        lambda value: validation.storyboard(value, facts, config['seconds'] * config['fps']),
                        [req(event['event_id'], event['must_show']) for event in facts['events']] +
-                       [req('ORDER', '事件顺序、因果、镜头边界状态和节奏正确，动作有充分可见时间')])
+                       [req('ORDER', '事件顺序、因果、镜头边界状态和节奏正确，动作有充分可见时间')],
+                       visual_scope='plan')
     write_json(project.root / 'plans/storyboard.json', board)
     write_json(project.root / 'plans/event_shot_coverage.json', {
         e['event_id']: [s['shot_id'] for s in board['shots'] if e['event_id'] in s['event_ids']]
@@ -279,7 +349,7 @@ def plan_frames(project, shot):
                        lambda data: validation.frame_plan(data, shot),
                        shot['requirements'] + [req('TIME', '全部动作阶段与状态切换有可审核的关键帧和时间点，区间覆盖完整')],
                        prepare=prepare_frame_plan,
-                       # 明确已有的校验契约，不改变已审核任务的输入及语义要求。
-                       # 在生成时补充指导，避免导致已通过的分镜和其他镜头失效。
-                       generation_context=frame_plan_context(shot, project.config['fps']))
+                       # 生成时补充帧结构契约；美术硬要求由独立审核统一追加。
+                       generation_context=frame_plan_context(shot, project.config['fps']),
+                       visual_scope='plan')
     return value

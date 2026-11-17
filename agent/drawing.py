@@ -29,7 +29,8 @@ def assets(project, facts, bible):
                                      frame_count=1, sample_indices=[0])
             images = rendering.preview_images(preview)
             review(project, directory, 'review', asset_id, version, asset['requirements'],
-                   {'asset': asset, 'style': bible['style']}, image_inputs(images), [0])
+                   {'asset': asset, 'style': bible['style']}, image_inputs(images), [0],
+                   visual_scope='reference')
             return {'asset_id': asset_id, 'version': version, 'image': relative(project, images[0][1]),
                     'html': relative(project, html), 'fixed': asset['fixed'], 'variable': asset['variable']}
         results[asset_id] = project.task(f'assets/{asset_id}', asset,
@@ -108,7 +109,7 @@ def shot(project, spec, frames, references, previous_shot=None, next_shot=None):
             local_plan = prepare_frame_plan(directory, local_plan)
             validation.frame_plan(local_plan, spec)
             review(project, directory, 'replan_review', shot_id, version, spec['requirements'],
-                   {'shot': spec, 'candidate_frame_plan': local_plan})
+                   {'shot': spec, 'candidate_frame_plan': local_plan}, visual_scope='plan')
             payload['frame_plan'] = local_plan
         if previous_shot:
             previous_image = project.root / previous_shot['last_frame']
@@ -190,8 +191,10 @@ def shot(project, spec, frames, references, previous_shot=None, next_shot=None):
                     'instruction': '涉及上一镜头尺寸/姿态/背景承接时，比较该实际参考图与当前帧；'
                         '当前帧的位置和状态仍只依据当前帧。不得从计划文字臆测上一镜头画面。'}}
             review(project, directory, f'check_{key["frame_id"]}', target, version, key['requirements'],
-                   {'shot': spec, 'task': key, 'fixed_assets': references, **entry_context},
-                   refs + entry_images + image_inputs(comparisons + current), [i for i, _ in comparisons + current])
+                   {'shot': spec, 'task': key, 'fixed_assets': references,
+                    'allowed_black_ranges': local_plan.get('allowed_black_ranges', []), **entry_context},
+                   refs + entry_images + image_inputs(comparisons + current), [i for i, _ in comparisons + current],
+                   visual_scope='frame')
             approved += current
         indices = validation.sample_indices(local_plan, count)
         preview = directory / 'preview'
@@ -215,7 +218,7 @@ def shot(project, spec, frames, references, previous_shot=None, next_shot=None):
                     '在任何采样帧不满足时仍必须失败。'
                     '两侧实际像素的衔接由所有镜头生成后的 checks/timeline 独立审核，'
                     '任何边界未通过都不能发布 final.mp4。'},
-               refs + image_inputs(images), [i for i, _ in images])
+               refs + image_inputs(images), [i for i, _ in images], visual_scope='temporal')
         if not (preview / 'video.mp4').exists():
             rendering.render_job(html, preview, 2, fps, frame_count=count, sample_indices=indices)
         technical = rendering.inspect_video(preview / 'video.mp4', count, fps, local_plan.get('allowed_black_ranges', []))

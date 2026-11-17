@@ -717,7 +717,9 @@ class WorkflowTests(unittest.TestCase):
                 result = {'patches': [{'old': 'ctx.resetTransform();', 'new': 'ctx.resetTransform();\n'}]}
             if payload.get('target_id') == 'S01_K01':
                 seen.append(payload)
-                self.assertEqual(payload['required_check_ids'], ['STATE'])
+                self.assertEqual(payload['required_check_ids'][0], 'STATE')
+                self.assertEqual(set(payload['required_check_ids'][1:]),
+                                 {'DEPTH_VOLUME', 'DEPTH_ILLUSTRATION', 'DEPTH_SPACE'})
                 self.assertTrue(payload['requirements'][0]['hard'])
                 self.assertEqual(payload['evidence_mode'], 'pixels')
                 result['status'] = 'UNCERTAIN'

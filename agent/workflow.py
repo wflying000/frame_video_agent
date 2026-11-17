@@ -147,6 +147,16 @@ def final_check(project, facts, board, shots):
         indices = sorted({key['frame_index'] + shot['start_frame'] for shot in shots
                           for key in shot['frame_plan']['keyframes']} |
                          {i for shot in shots for i in (shot['start_frame'], shot['end_frame'] - 1)})
+        # 首尾可能是合法黑转场；再从每镜头时序采样中选首/中/尾有效帧，数量有界。
+        appearance_indices = set()
+        for shot in shots:
+            local = planning.depth_frame_indices(validation.sample_indices(
+                shot['frame_plan'], shot['end_frame'] - shot['start_frame']),
+                shot['frame_plan'].get('allowed_black_ranges', []))
+            if local:
+                appearance_indices.update(shot['start_frame'] + local[i]
+                                          for i in {0, len(local) // 2, len(local) - 1})
+        indices = sorted(set(indices) | appearance_indices)
         if not (directory / 'frames/preview_manifest.json').exists():
             rendering.sample_video(video, directory / 'frames', indices)
         images = rendering.preview_images(directory / 'frames')
@@ -155,6 +165,48 @@ def final_check(project, facts, board, shots):
             batch = images[i:i + 12]
             observations += observe_batch(project, directory, f'observe_{i // 12}', batch)
         write_json(directory / 'independent_observations.json', observations)
+        # 从编码成片逐镜头复验美术硬门槛，不能只相信规划或编码前的 PASS。
+        # 与事件审核分开，确保剧情证据不被风格检查项替代，并可准确定位修复镜头。
+        appearance = {}
+        for shot in shots:
+            shot_id = shot['shot_id']
+            evidence = [(frame, path) for frame, path in images
+                        if shot['start_frame'] <= frame < shot['end_frame']]
+            spec = next(spec for spec in board['shots'] if spec['shot_id'] == shot_id)
+            global_plan = dict(shot['frame_plan'], keyframes=[
+                dict(key, frame_index=key['frame_index'] + shot['start_frame'])
+                for key in shot['frame_plan']['keyframes']], critical_frames=[
+                frame + shot['start_frame'] for frame in shot['frame_plan']['critical_frames']], intervals=[
+                dict(interval, start_frame=interval['start_frame'] + shot['start_frame'],
+                     end_frame=interval['end_frame'] + shot['start_frame'])
+                for interval in shot['frame_plan']['intervals']], allowed_black_ranges=[
+                [a + shot['start_frame'], b + shot['start_frame']]
+                for a, b in shot['frame_plan'].get('allowed_black_ranges', [])])
+            if not planning.depth_frame_indices(range(shot['start_frame'], shot['end_frame']),
+                                                global_plan['allowed_black_ranges']):
+                appearance[shot_id] = {'status': 'EXEMPT_DECLARED_BLACK',
+                    'shot_id': shot_id, 'allowed_black_ranges': global_plan['allowed_black_ranges']}
+                write_json(directory / f'appearance_{shot_id}.json', appearance[shot_id])
+                continue
+            try:
+                appearance[shot_id] = review(project, directory, f'appearance_{shot_id}',
+                    f'{shot_id}_appearance', version, [],
+                    {'shot': spec, 'frame_plan': global_plan,
+                     'verification_scope': '只核对当前镜头在实际编码成片中的体积、空间纵深、绘画质感与光影稳定性。'
+                         'frame_index 为成片全局帧号；图像证据必须来自当前镜头。'
+                         '若失败，repair.shot_ids 仅列当前 shot.shot_id，保留已通过的剧情和其他镜头。'},
+                    drawing.image_inputs(evidence), [frame for frame, _ in evidence], visual_scope='temporal')
+            except Rejected as failure:
+                # 当前证据只来自一个已知镜头；不允许模型误指另一个有效镜头。
+                report = dict(failure.report)
+                repair = dict(report.get('repair') or {})
+                report['appearance_repair_binding'] = {
+                    'shot_id': shot_id, 'model_shot_ids': repair.get('shot_ids', []),
+                    'original_report': f'appearance_{shot_id}.json'}
+                report['repair'] = dict(repair, shot_ids=[shot_id])
+                write_json(directory / f'appearance_{shot_id}_repair_binding.json', report)
+                raise Rejected(report) from failure
+        write_json(directory / 'appearance_evidence.json', appearance)
         coverage = {}
         for event in facts['events']:
             relevant = [shot for shot in board['shots'] if event['event_id'] in shot['event_ids']]
@@ -180,7 +232,8 @@ def final_check(project, facts, board, shots):
                {'original_story': config['story'], 'facts': facts, 'coverage': coverage,
                 'independent_observations': observations}, mode='observations')
         write_json(directory / 'event_evidence.json', coverage)
-        return {'video': drawing.relative(project, video), 'status': 'PASS', 'coverage': coverage}
+        return {'video': drawing.relative(project, video), 'status': 'PASS', 'coverage': coverage,
+                'appearance': appearance}
     return project.task('exports/final', {'story': facts, 'storyboard': board}, deps, action,
                         max_attempts=3, retry=False)
 
