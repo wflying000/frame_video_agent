@@ -7,6 +7,7 @@ from .common import digest, file_hash, log, read_json, write_json
 from .planning import frame_plan_context, prepare_frame_plan, prior, req, review, validate_review_evidence
 
 KEYFRAME_REVIEW_PROTOCOL = 'keyframe_reasoned_v3'
+REFERENCE_REASONED_PROTOCOL = 'reference_reasoned_v1'
 
 
 def relative(project, path):
@@ -78,6 +79,159 @@ def observe_reference(project, directory, images):
             log('格式', f'参考图观察：{error}；同一候选内有限修正一次')
 
 
+def validate_reference_source_evidence(project, source, messages, metadata, payload, pixels):
+    """Rebuild the recorded request from preserved image files and verify its original call signature."""
+    from .store import Blocked
+    try:
+        urls = {}
+        for path in source.parent.rglob('*'):
+            if path.is_file() and path.suffix.lower() in {'.png', '.jpg', '.jpeg'}:
+                url = model.messages('', {}, [('', path)])[1]['content'][-1]['image_url']['url']
+                urls[digest(url)] = url
+        actual = json.loads(json.dumps(messages))
+        requested = set()
+        for message in actual:
+            if isinstance(message.get('content'), list):
+                for part in message['content']:
+                    if part.get('type') == 'image_url':
+                        key = part['image_url']['sha256']
+                        requested.add(key)
+                        part['image_url'] = {'url': urls[key]}
+        validation.require(requested, '旧参考审核没有实际图像')
+        validation.require(metadata.get('input_hash') == digest({'messages': actual, 'settings': metadata['model']}),
+                           '旧参考审核请求或有效配置与原调用签名不匹配')
+        transport = source.parent / 'review_transport/manifest.json'
+        rows = read_json(transport).get('images', []) if transport.exists() else []
+        encoder = {'codec': 'mjpeg', 'q': 2, 'pixel_format': 'yuvj444p', 'resize': False, 'crop': False}
+        for _, path in pixels:
+            url = model.messages('', {}, [('', path)])[1]['content'][-1]['image_url']['url']
+            if digest(url) in requested:
+                continue
+            matched = False
+            for row in rows:
+                encoded = Path(row.get('encoded_path', '')).resolve()
+                if (row.get('original_path') == str(path.resolve()) and
+                    row.get('original_sha256') == file_hash(path) and row.get('encoder') == encoder and
+                    encoded.is_relative_to(source.parent) and encoded.is_file() and
+                    row.get('encoded_sha256') == file_hash(encoded)):
+                    encoded_url = model.messages('', {}, [('', encoded)])[1]['content'][-1]['image_url']['url']
+                    matched = matched or digest(encoded_url) in requested
+            validation.require(matched, '旧参考PNG与正式审核请求/传输来源不匹配')
+        report = read_json(source.parent / 'review.json')
+        validation.require(payload['required_check_ids'] == [item['id'] for item in payload['requirements']],
+                           '旧参考审核检查项列表不完整')
+        validation.review(report, payload['target_id'], payload['target_version'], payload['requirements'])
+        validate_review_evidence(report, [index for index, _ in pixels], payload)
+        failure = source.parent / 'failure.json'
+        if failure.exists():
+            attempts = project.data.get('tasks', {}).get(f"assets/{payload['target_id']}", {}).get('attempts', [])
+            previous = next(item for item in attempts if item['version'] == payload['target_version'])
+            validation.require(previous.get('report') == read_json(failure), '旧失败报告与保存的候选记录不匹配')
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError, OSError, StopIteration) as error:
+        raise Blocked('参考图推理复验的旧像素、请求或报告证据不完整或已改变。') from error
+
+
+def reference_reasoned_binding(project, source, descriptor, options):
+    """Only upgrade a verifiable ordinary reference call with genuinely different inference settings."""
+    from .store import Blocked
+    if (source is None or not source.is_file() or not source.resolve().is_relative_to(project.root)
+            or file_hash(source) != descriptor['source_hash']):
+        raise Blocked('参考图推理复验的源版本不匹配，不自动消耗后续候选。')
+    if (source.parent / 'reference_reasoned_recheck_provenance.json').exists():
+        raise Blocked('来源已使用当前参考推理协议，不能重复协议复验。')
+    request = source.parent / 'review.request.json'
+    call = source.parent / 'review.call.json'
+    if not request.is_file() or not call.is_file():
+        raise Blocked('参考图推理复验缺少可验证的旧正式审核请求或参数。')
+    try:
+        messages = read_json(request)
+        payload = json.loads(messages[1]['content'][0]['text'])
+        metadata = read_json(call)
+        settings = metadata['model']
+        protocol = payload.get('reference_review_protocol', 'reference_observation_v1')
+        source_version = int(source.parent.name.removeprefix('v'))
+        valid = (messages[0]['content'] == prompts.REVIEW and
+                 payload.get('visual_scope') == 'reference' and
+                 payload.get('evidence_mode') == 'pixels' and
+                 payload.get('target_id') == source.parent.parent.name and
+                 payload.get('target_version') == source_version and
+                 protocol == 'reference_observation_v1' and
+                 metadata.get('status') == 'PASS' and isinstance(settings, dict) and
+                 isinstance(settings.get('extra_body'), dict) and
+                 all(isinstance(settings.get(key), str) and settings[key]
+                     for key in ('base_url', 'model')))
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+        valid = False
+    if not valid:
+        raise Blocked('参考图推理复验仅允许来源完整的旧普通参考审核，不能重复协议复验。')
+    effective = model.effective_settings(options)
+    if (not options or settings == effective or
+            settings['extra_body'].get('thinking') != {'type': 'disabled'}):
+        raise Blocked('旧参考审核已启用推理或端点不支持有效覆盖，不能无意义重复复验。')
+    if any(settings[key] != effective[key] for key in ('base_url', 'model')):
+        raise Blocked('参考图推理复验不能同时更换审核端点或模型。')
+    report = source.parent / 'review.json'
+    failure = source.parent / 'failure.json'
+    try:
+        pixels = rendering.preview_images(source.parent / 'preview')
+        if not report.is_file() or not pixels or any(not path.is_file() for _, path in pixels):
+            raise ValueError('missing report or pixels')
+        pixel_hashes = [{'frame_index': index, 'path': relative(project, path), 'hash': file_hash(path)}
+                        for index, path in pixels]
+    except (ValueError, KeyError, TypeError, OSError):
+        raise Blocked('参考图推理复验缺少实际旧像素或正式报告，不能验证来源。')
+    validate_reference_source_evidence(project, source, messages, metadata, payload, pixels)
+    return {'source': relative(project, source), 'source_hash': descriptor['source_hash'],
+            'source_version': source_version, 'source_pixels': pixel_hashes,
+            'source_report_hash': file_hash(report),
+            'source_failure_hash': file_hash(failure) if failure.exists() else None,
+            'source_request_hash': file_hash(request), 'source_call_hash': file_hash(call),
+            'from_protocol': protocol, 'to_protocol': REFERENCE_REASONED_PROTOCOL,
+            'previous_effective_settings': settings,
+            'visual_review_extra_body': options, 'effective_settings': effective}
+
+
+def reference_reasoned_task_binding(project, asset_id, descriptor, options):
+    """Keep resumed task signatures bound to the original request, even after the new candidate exists."""
+    attempts = project.data.get('tasks', {}).get(f'assets/{asset_id}', {}).get('attempts', [])
+    previous = attempts[-1] if attempts else None
+    source = project.root / previous['path'] / 'reference.html' if previous else None
+    if previous:
+        proof = source.parent / 'reference_reasoned_recheck_provenance.json'
+        if proof.exists():
+            saved = read_json(proof)
+            if saved.get('source_hash') == descriptor['source_hash']:
+                source = project.root / saved['source']
+        elif previous['status'] in {'RUNNING', 'RETRY'}:
+            earlier = attempts[-2] if len(attempts) > 1 else None
+            source = project.root / earlier['path'] / 'reference.html' if earlier else None
+    return reference_reasoned_binding(project, source, descriptor, options)
+
+
+def reference_reasoned_recheck_source(project, directory, previous, descriptor, options, binding):
+    """One source-preserving explicit inference upgrade; never reroll the same source/protocol."""
+    from .store import Blocked
+    source = project.root / previous['path'] / 'reference.html' if previous else None
+    actual = reference_reasoned_binding(project, source, descriptor, options)
+    if actual != binding:
+        raise Blocked('参考图推理复验来源或有效参数改变，不能覆盖来源绑定。')
+    provenance = directory / 'reference_reasoned_recheck_provenance.json'
+    for path in source.parent.parent.glob('v*/reference_reasoned_recheck_provenance.json'):
+        saved = read_json(path)
+        if path.resolve() == provenance.resolve():
+            if (any(saved.get(key) != value for key, value in binding.items()) or
+                    saved.get('reason') != descriptor['reason']):
+                raise Blocked('当前候选参考图推理复验绑定已改变，不能覆盖来源记录。')
+        elif (saved.get('source_hash') == descriptor['source_hash'] and
+              saved.get('to_protocol') == REFERENCE_REASONED_PROTOCOL):
+            raise Blocked('相同源码已升级当前参考推理协议，不能重复协议复验。')
+    if not provenance.exists():
+        write_json(provenance, {**binding, 'source_version': previous['version'],
+            'reason': descriptor['reason'], 'options_source': 'model.visual_review_options',
+            'provenance': 'review_protocol_upgrade', 'requires_full_review': True})
+    return source.read_bytes()
+
+
 def assets(project, facts, bible):
     results = {}
     for asset in bible['assets']:
@@ -85,12 +239,21 @@ def assets(project, facts, bible):
         feedback = project.data['repair_requests'].get(asset_id, {})
         descriptor = feedback.get('local_patch')
         recheck = feedback.get('reference_recheck')
-        validation.require(not (descriptor and recheck), '参考图代码补丁与协议复验不能同时指定')
+        reasoned = feedback.get('reference_reasoned_recheck')
+        validation.require(sum(item is not None for item in (descriptor, recheck, reasoned)) <= 1,
+                           '参考图代码补丁、观察协议复验与推理复验不能同时指定')
+        options, binding = None, None
+        if reasoned is not None:
+            validation.require(isinstance(reasoned, dict), '参考图推理复验描述必须是对象')
+            validation.text(reasoned.get('source_hash'), 'reference_reasoned_recheck.source_hash')
+            validation.text(reasoned.get('reason'), 'reference_reasoned_recheck.reason')
+            options = model.visual_review_options()
+            binding = reference_reasoned_task_binding(project, asset_id, reasoned, options)
         if recheck:
             validation.require(isinstance(recheck, dict), '参考图协议复验描述必须是对象')
             validation.text(recheck.get('source_hash'), 'reference_recheck.source_hash')
             validation.text(recheck.get('reason'), 'reference_recheck.reason')
-        regions = (descriptor or recheck or {}).get('review_regions', [])
+        regions = (descriptor or recheck or reasoned or {}).get('review_regions', [])
         validation.require(isinstance(regions, list) and len(regions) <= 2,
                            '资产审核局部区域必须是列表且最多两个')
         for region in regions:
@@ -99,8 +262,14 @@ def assets(project, facts, bible):
                                region[0] < region[2] and region[1] < region[3],
                                '资产审核局部区域坐标无效')
         def action(directory, version, previous, asset=asset, asset_id=asset_id,
-                   descriptor=descriptor, regions=regions, recheck=recheck):
-            if recheck:
+                   descriptor=descriptor, regions=regions, recheck=recheck, reasoned=reasoned,
+                   options=options, binding=binding):
+            html_bytes = None
+            if reasoned is not None:
+                html_bytes = reference_reasoned_recheck_source(
+                    project, directory, previous, reasoned, options, binding)
+                log('复核', f'{asset_id}：保留参考图源码，按显式推理协议完整复验一次')
+            elif recheck:
                 source = project.root / previous['path'] / 'reference.html' if previous else None
                 from .store import Blocked
                 if source is None or not source.is_file() or file_hash(source) != recheck['source_hash']:
@@ -128,12 +297,20 @@ def assets(project, facts, bible):
                 validation.text(value.get('html'), 'html')
                 html_text = value['html']
             html = directory / 'reference.html'
-            html.write_text(html_text, encoding='utf-8')
+            if html_bytes is not None:
+                html.write_bytes(html_bytes)
+            else:
+                html.write_text(html_text, encoding='utf-8')
             preview = directory / 'preview'
             if not (preview / 'preview_manifest.json').exists():
                 rendering.render_job(html, preview, 2, project.config['fps'], preview=True,
                                      frame_count=1, sample_indices=[0], **render_options(project))
             images = rendering.preview_images(preview)
+            if reasoned is not None:
+                expected = [(row['frame_index'], row['hash']) for row in binding['source_pixels']]
+                if [(index, file_hash(path)) for index, path in images] != expected:
+                    from .store import Blocked
+                    raise Blocked('参考图推理复验重画像素与绑定旧图不同，不能把变化后的画面当作同源复验。')
             review_images = image_inputs(images)
             for index, region in enumerate(regions):
                 crop = directory / 'review_evidence' / f'crop_{index:02d}.png'
@@ -141,12 +318,30 @@ def assets(project, facts, bible):
                 review_images.append((f'原图局部放大：实际画面 frame_index=0，region_xyxy={region}；'
                                       '坐标对应原始全图，放大图不是新帧，不能替代全图审核', crop))
             observations = observe_reference(project, directory, review_images)
-            review(project, directory, 'review', asset_id, version, asset['requirements'],
-                   {'asset': asset, 'style': bible['style'],
-                    'independent_observations': observations,
-                    'observation_context': '独立观察仅为看图辅助，不能代替实际像素证据、修改或覆盖任何审核要求。'
-                        '审核仍须逐项对照全图与局部；观察与画面冲突时以真实画面为准。'}, review_images, [0],
-                   visual_scope='reference')
+            payload = {'asset': asset, 'style': bible['style']}
+            if reasoned is not None:
+                # Keep observations on disk without anchoring formal acceptance to their descriptions.
+                payload.update(reference_review_protocol=REFERENCE_REASONED_PROTOCOL,
+                               reference_reasoned_binding=binding)
+            else:
+                payload.update(independent_observations=observations,
+                    observation_context='独立观察仅为看图辅助，不能代替实际像素证据、修改或覆盖任何审核要求。'
+                        '审核仍须逐项对照全图与局部；观察与画面冲突时以真实画面为准。')
+            try:
+                review(project, directory, 'review', asset_id, version, asset['requirements'],
+                       payload, review_images, [0], visual_scope='reference',
+                       **({'extra_body': options} if reasoned is not None else {}))
+            finally:
+                if reasoned is not None:
+                    # Retain hashes even when the formal result rejects the unchanged pixels.
+                    proof_path = directory / 'reference_reasoned_recheck_provenance.json'
+                    proof = read_json(proof_path)
+                    proof['current_review_requests'] = [
+                        {'path': relative(project, path), 'hash': file_hash(path),
+                         'call': read_json(path.with_name(path.name.replace('.request.json', '.call.json')))}
+                        for path in sorted(directory.glob('review*.request.json'))
+                        if path.with_name(path.name.replace('.request.json', '.call.json')).exists()]
+                    write_json(proof_path, proof)
             return {'asset_id': asset_id, 'version': version, 'image': relative(project, images[0][1]),
                     'html': relative(project, html), 'fixed': asset['fixed'], 'variable': asset['variable']}
         inputs = {'asset': asset, 'review_protocol': 'reference_observation_v1'}
@@ -154,8 +349,18 @@ def assets(project, facts, bible):
             inputs['local_patch'] = descriptor
         if recheck:
             inputs['reference_recheck'] = recheck
-        results[asset_id] = project.task(f'assets/{asset_id}', inputs,
-                                        ['plans/story', 'plans/visual'], action)
+        if reasoned is not None:
+            inputs.update(review_protocol=REFERENCE_REASONED_PROTOCOL,
+                          reference_reasoned_recheck=reasoned, reference_reasoned_binding=binding)
+        from .store import Blocked, Rejected
+        try:
+            results[asset_id] = project.task(f'assets/{asset_id}', inputs,
+                                            ['plans/story', 'plans/visual'], action,
+                                            **({'retry': False} if reasoned is not None else {}))
+        except Rejected as error:
+            if reasoned is not None:
+                raise Blocked('参考图推理复验未通过；已保留同源候选及正式报告，请修复实际失败原因。') from error
+            raise
     write_json(project.root / 'assets/approved.json', results)
     return results
 

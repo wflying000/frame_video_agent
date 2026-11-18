@@ -364,6 +364,8 @@ python -m agent generate my_story.txt --out outputs/my_story --resume \
 
 The project is marked `COMPLETED` only after acceptance. Failures, uncertainty, or insufficient budget leave it `BLOCKED`, retain its artifacts, and return an error. An output directory has a single-writer lock; do not run multiple processes against the same project directory.
 
+For a diagnosed reference-image review failure, an explicit `reference_reasoned_recheck` repair request can preserve the exact source and PNGs and upgrade a verified ordinary review to high reasoning once. The recheck binds the original image, report, request and model settings; missing or changed evidence and repeated upgrades are rejected. Formal review uses the original requirements and actual pixels, without prior failure conclusions or free-form observations. All checks, candidate limits and budgets remain in force; ordinary reference reviews keep their configured settings.
+
 ## 6. Source Code and Outputs
 
 | Source file | Responsibility |
