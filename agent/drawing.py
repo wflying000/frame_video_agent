@@ -310,7 +310,7 @@ def assets(project, facts, bible):
                 expected = [(row['frame_index'], row['hash']) for row in binding['source_pixels']]
                 if [(index, file_hash(path)) for index, path in images] != expected:
                     from .store import Blocked
-                    raise Blocked('参考图推理复验重画像素与绑定旧图不同，不能把变化后的画面当作同源复验。')
+                    raise Blocked('参考图推理复验重画像素与绑定旧图不同，请对新画面建立修复候选并完整审核。')
             review_images = image_inputs(images)
             for index, region in enumerate(regions):
                 crop = directory / 'review_evidence' / f'crop_{index:02d}.png'
@@ -500,8 +500,8 @@ def temporal_recheck_source(project, directory, previous, descriptor):
     tasks_path = source.parent / 'frame_tasks.json'
     tasks = read_json(tasks_path) if tasks_path.exists() else {}
     source_protocol = tasks.get('temporal_evidence_protocol')
-    if source_protocol not in {'sample_timing_v1', 'windowed_v2', 'windowed_local_v3', 'windowed_comparison_v4'}:
-        raise Blocked('时序协议复验仅允许 sample_timing_v1、windowed_v2、windowed_local_v3 或 windowed_comparison_v4 旧候选，'
+    if source_protocol not in {'sample_timing_v1', 'windowed_v2', 'windowed_local_v3', 'windowed_comparison_v4', 'windowed_reasoned_v5'}:
+        raise Blocked('时序协议复验仅允许 sample_timing_v1、windowed_v2、windowed_local_v3、windowed_comparison_v4 或 windowed_reasoned_v5 旧候选，'
                       '不能重复协议复验；请修复实际失败原因。')
     write_json(directory / 'temporal_recheck_provenance.json', {
         'source': relative(project, source), 'source_hash': descriptor['source_hash'],

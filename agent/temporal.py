@@ -11,7 +11,7 @@ from .common import digest, file_hash, read_json, write_json
 from .planning import req, review, validate_review_evidence
 from .store import Rejected
 
-PROTOCOL = 'windowed_reasoned_v5'
+PROTOCOL = 'windowed_phase_scope_v6'
 RELATIVE_MOTION_POLICY_VERSION = 'body_relative_motion_v1'
 
 
@@ -565,6 +565,8 @@ def review_windows(project, directory, shot_id, version, requirements, payload, 
                        verification_scope='逐帧检查本窗口全部实际采样及相邻样本之间的连续性、身份、接触、体积和照明。'
                            '本窗口按LOCAL_STATE、LOCAL_CONTINUITY、LOCAL_IDENTITY_CONTACT及体积光影硬检查验收。'
                            'original_shot_requirements保留完整原要求作为适用约束，不要求窗内完成全段剧情或窗外终态；'
+                           '累计移动距离和完整交替属于完整动作区间，由全局审核验证；局部窗口只检查对应的推进、减速或停止阶段。'
+                           '不得把完整动作区间的位移或完整交替要求重复施加到每个局部窗口；计划已停止时应验证保持稳定。'
                            '不得要求本窗口提前完成窗外剧情，也不得豁免本区间适用的硬要求。'
                            '该时刻应有的身份、分离、对接、连接、接触和稳定性在实际帧不满足时必须FAIL；'
                            '计划尚处于分离或靠近阶段时，不能因尚未完成连接而判失败。'

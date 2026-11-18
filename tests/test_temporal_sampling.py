@@ -36,11 +36,11 @@ class TemporalSamplingTests(unittest.TestCase):
             refs = test_keyframe_observation.KeyframeObservationTests().seed(project)
             with patch.object(project, 'task', wraps=project.task) as task:
                 result = drawing.shot(project, self.shot, self.plan, refs)
-            self.assertEqual(task.call_args.args[1]['temporal_evidence_protocol'], 'windowed_reasoned_v5')
+            self.assertEqual(task.call_args.args[1]['temporal_evidence_protocol'], 'windowed_phase_scope_v6')
             payload = next(data for system, data in fake.calls
                            if system == prompts.REVIEW and data.get('target_id') == 'S01')
             self.assertEqual(payload['fps'], 24)
-            self.assertEqual(payload['temporal_evidence_protocol'], 'windowed_reasoned_v5')
+            self.assertEqual(payload['temporal_evidence_protocol'], 'windowed_phase_scope_v6')
             manifest = read_json(self.root / 'segments/S01/v001/preview/preview_manifest.json')
             actual = [row['frame_index'] for row in manifest]
             self.assertEqual([row['frame_index'] for row in payload['sample_timing']], actual)
@@ -60,7 +60,7 @@ class TemporalSamplingTests(unittest.TestCase):
                             {row['id'] for row in payload['original_shot_requirements']})
             self.assertTrue(all(row['hard'] for row in payload['requirements']))
             task_record = read_json(self.root / 'segments/S01/v001/frame_tasks.json')
-            self.assertEqual(task_record['temporal_evidence_protocol'], 'windowed_reasoned_v5')
+            self.assertEqual(task_record['temporal_evidence_protocol'], 'windowed_phase_scope_v6')
             self.assertEqual([row['frame_index'] for row in result['samples']], actual)
             self.assertTrue(all(len(project.data['tasks'][name]['attempts']) == 1 for name in
                 ['plans/story', 'plans/visual', 'plans/storyboard', 'plans/frames/S01', 'assets/P01']))

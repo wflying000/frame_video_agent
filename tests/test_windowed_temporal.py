@@ -94,6 +94,9 @@ class WindowReviewTests(unittest.TestCase):
                 self.assertLessEqual(len(indices), 12)
                 self.assertEqual(indices, context['temporal_window']['actual_frame_indices'])
                 self.assertIn('不得豁免本区间适用的硬要求', context['verification_scope'])
+                self.assertIn('累计移动距离和完整交替属于完整动作区间，由全局审核验证', context['verification_scope'])
+                self.assertIn('局部窗口只检查对应的推进、减速或停止阶段', context['verification_scope'])
+                self.assertIn('计划已停止时应验证保持稳定', context['verification_scope'])
                 self.assertIn('窗外最近前后锚点只是计划文本', context['verification_scope'])
                 self.assertIn('标准资产只用于身份与材质参照', context['verification_scope'])
             self.assertEqual(union, set(self.samples))
@@ -113,7 +116,7 @@ class WindowReviewTests(unittest.TestCase):
                 self.assertIn('应分离阶段不得要求提前连接', context['requirements'][2]['text'])
             self.assertNotIn('original_shot_requirements', global_context)
             for context in contexts:
-                self.assertEqual(context['temporal_evidence_protocol'], 'windowed_reasoned_v5')
+                self.assertEqual(context['temporal_evidence_protocol'], 'windowed_phase_scope_v6')
                 self.assertEqual(context['fps'], 24)
                 self.assertIn('DEPTH_STABILITY', context['required_check_ids'])
             for summary in global_context['temporal_window_evidence']:
@@ -129,7 +132,7 @@ class WindowReviewTests(unittest.TestCase):
                 self.assertTrue(row['artifacts'])
                 for item in row['artifacts'] + row['images']:
                     self.assertEqual(item['hash'], file_hash(self.root / item['path']))
-            self.assertEqual(read_json(directory / 'frame_tasks.json')['temporal_evidence_protocol'], 'windowed_reasoned_v5')
+            self.assertEqual(read_json(directory / 'frame_tasks.json')['temporal_evidence_protocol'], 'windowed_phase_scope_v6')
             self.assertEqual(len(result['samples']), 64)
             # 相同像素、要求和窗口不因新候选号改变审核签名，保持恢复预算有界。
             project.invalidate('segments/S01')
@@ -201,7 +204,7 @@ class WindowReviewTests(unittest.TestCase):
         return source
 
     def test_one_time_recheck_keeps_source_and_old_failure_and_rejects_further_upgrade(self):
-        for old_protocol in ('sample_timing_v1', 'windowed_v2', 'windowed_local_v3', 'windowed_comparison_v4'):
+        for old_protocol in ('sample_timing_v1', 'windowed_v2', 'windowed_local_v3', 'windowed_comparison_v4', 'windowed_reasoned_v5'):
             fake = FakeModel()
             with self.subTest(old_protocol=old_protocol), Project(self.root / old_protocol, self.config) as project, \
                     patch.object(model, 'ask', side_effect=fake), \
@@ -220,7 +223,7 @@ class WindowReviewTests(unittest.TestCase):
                 proof = read_json(directory / 'temporal_recheck_provenance.json')
                 self.assertEqual(proof['source_hash'], file_hash(source))
                 self.assertEqual(proof['from_protocol'], old_protocol)
-                self.assertEqual(proof['to_protocol'], 'windowed_reasoned_v5')
+                self.assertEqual(proof['to_protocol'], 'windowed_phase_scope_v6')
                 self.assertFalse(any(system in (prompts.PATCH, prompts.CANVAS) for system, _ in fake.calls))
                 project.invalidate('segments/S01')
                 calls = project.data['calls']
@@ -229,11 +232,11 @@ class WindowReviewTests(unittest.TestCase):
                 self.assertEqual(project.data['calls'], calls)
 
     def test_recheck_rejects_source_mismatch_other_protocol_and_conflicting_mutations(self):
-        for fault in ('hash', 'windowed_reasoned_v5', 'missing_protocol', 'local_patch', 'local_source', 'keyframe_recheck'):
+        for fault in ('hash', 'windowed_phase_scope_v6', 'missing_protocol', 'local_patch', 'local_source', 'keyframe_recheck'):
             with self.subTest(fault=fault), Project(self.root / fault, self.config) as project, \
                     patch.object(model, 'ask', side_effect=FakeModel()):
                 refs = test_keyframe_observation.KeyframeObservationTests().seed(project)
-                self.old_candidate(project, fault if fault in ('windowed_reasoned_v5', 'missing_protocol') else 'sample_timing_v1')
+                self.old_candidate(project, fault if fault in ('windowed_phase_scope_v6', 'missing_protocol') else 'sample_timing_v1')
                 feedback = project.data['repair_requests']['S01']
                 if fault == 'hash':
                     feedback['temporal_recheck']['source_hash'] = '0' * 64
@@ -250,12 +253,12 @@ class WindowReviewTests(unittest.TestCase):
             path = self.root / 'frame.png'
             path.write_bytes(b'actual frame')
             images = [('实际画面 frame_index=0', path)]
-            for version, protocol in enumerate(('sample_timing_v1', 'windowed_v2', 'windowed_local_v3', 'windowed_comparison_v4', 'windowed_reasoned_v5'), 1):
+            for version, protocol in enumerate(('sample_timing_v1', 'windowed_v2', 'windowed_local_v3', 'windowed_comparison_v4', 'windowed_reasoned_v5', 'windowed_phase_scope_v6'), 1):
                 result = planning.review(project, self.root / f'segments/S01/v{version:03d}',
                                          'temporal_review', 'S01', version, REQ,
                                          {'temporal_evidence_protocol': protocol}, images, [0])
                 self.assertNotIn('reused_from', result)
-            self.assertEqual(len(fake.calls), 5)
+            self.assertEqual(len(fake.calls), 6)
 
 
 if __name__ == '__main__':
