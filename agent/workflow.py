@@ -1,8 +1,11 @@
 """分步验收、局部修复和最终发布的调度流程。"""
-from . import drawing, model, planning, prompts, rendering, validation
+from . import drawing, model, planning, prompts, rendering, temporal, validation
 from .common import WIDTH, HEIGHT, log, read_json, write_json
 from .planning import req, review
 from .store import Blocked, Project, Rejected
+from .temporal import representative_images
+
+FINAL_EVIDENCE_PROTOCOL = 'temporal_coverage_v2'
 
 
 def pacing_text(board, fps, seconds):
@@ -54,6 +57,7 @@ def check_pacing(project, board, assets):
 
 
 def check_boundaries(project, board, shots):
+    review_options = model.visual_review_options()
     deps = [f'segments/{shot["shot_id"]}' for shot in shots]
     def action(directory, version, previous):
         for i in range(1, len(shots)):
@@ -73,7 +77,7 @@ def check_boundaries(project, board, shots):
                     req('MOTION_PHASE', '连续动作在边界承接前帧的部件姿态、形变和运动相位；'
                         '不得因新镜头局部时间归零而出现头部回缩、身体突然伸直、尾部跳位或背景无故消失')],
                    {'left_shot': board['shots'][i - 1], 'right_shot': board['shots'][i],
-                    'continuity_review_version': 3,
+                    'continuity_review_version': 3, 'visual_review_extra_body': review_options,
                     'boundary_frames': [left['end_frame'] - 1, right['start_frame']],
                     'decoded_frame_changes': changes,
                     'boundary_phase_context': {
@@ -96,9 +100,10 @@ def check_boundaries(project, board, shots):
                         '后续完整动作仍由该镜头时序审核和成片事件审核验证；'
                         '若当前时刻已经应当出现的动作、连接关系或道具缺失，仍必须失败。'
                         '画面不足以判断边界连续性时用 UNCERTAIN，不按预设结论补全证据。'},
-                   drawing.image_inputs(images), [frame for frame, _ in images])
+                   drawing.image_inputs(images), [frame for frame, _ in images], extra_body=review_options)
         return {'status': 'PASS', 'boundaries': max(0, len(shots) - 1)}
-    return project.task('checks/timeline', {'storyboard': board, 'continuity_review_version': 3}, deps, action,
+    return project.task('checks/timeline', {'storyboard': board, 'continuity_review_version': 3,
+                        'visual_review_extra_body': review_options}, deps, action,
                         max_attempts=3, retry=False)
 
 
@@ -134,6 +139,11 @@ def observe_batch(project, directory, name, batch):
 
 def final_check(project, facts, board, shots):
     config = project.config
+    review_options = model.visual_review_options()
+    relative_shots = {shot['shot_id']: shot.get('relative_motion_policy_version') for shot in shots
+                      if shot.get('relative_motion_reference') is True}
+    validation.require(all(version == temporal.RELATIVE_MOTION_POLICY_VERSION for version in relative_shots.values()),
+                       '镜头相对运动参照版本不匹配')
     deps = ['checks/timeline'] + [f'segments/{shot["shot_id"]}' for shot in shots]
     def action(directory, version, previous):
         video = directory / 'candidate_final.mp4'
@@ -147,6 +157,17 @@ def final_check(project, facts, board, shots):
         indices = sorted({key['frame_index'] + shot['start_frame'] for shot in shots
                           for key in shot['frame_plan']['keyframes']} |
                          {i for shot in shots for i in (shot['start_frame'], shot['end_frame'] - 1)})
+        # 代表帧只从已实际采样的镜头索引中选择；像素仍须从编码成片重新解码。
+        representatives = set()
+        sampling = []
+        for shot in shots:
+            actual = sorted((sample['frame_index'], project.root / sample['path'])
+                            for sample in shot['samples'])
+            selected = representative_images(actual, shot['frame_plan'], limit=16)
+            representatives.update(shot['start_frame'] + index for index, _ in selected)
+            sampling.append({'shot_id': shot['shot_id'],
+                             'actual_local_frame_indices': [index for index, _ in actual],
+                             'representative_local_frame_indices': [index for index, _ in selected]})
         # 首尾可能是合法黑转场；再从每镜头时序采样中选首/中/尾有效帧，数量有界。
         appearance_indices = set()
         for shot in shots:
@@ -156,10 +177,17 @@ def final_check(project, facts, board, shots):
             if local:
                 appearance_indices.update(shot['start_frame'] + local[i]
                                           for i in {0, len(local) // 2, len(local) - 1})
-        indices = sorted(set(indices) | appearance_indices)
+        indices = sorted(set(indices) | representatives | appearance_indices)
         if not (directory / 'frames/preview_manifest.json').exists():
             rendering.sample_video(video, directory / 'frames', indices)
         images = rendering.preview_images(directory / 'frames')
+        validation.require([frame for frame, _ in images] == indices,
+                           '成片解码证据与要求的时序代表帧不一致')
+        write_json(directory / 'final_sampling.json', {
+            'final_evidence_protocol': FINAL_EVIDENCE_PROTOCOL,
+            'visual_review_extra_body': review_options,
+            'source_video': drawing.relative(project, video), 'shots': sampling,
+            'decoded_global_frame_indices': [frame for frame, _ in images]})
         observations = []
         for i in range(0, len(images), 12):
             batch = images[i:i + 12]
@@ -191,11 +219,12 @@ def final_check(project, facts, board, shots):
             try:
                 appearance[shot_id] = review(project, directory, f'appearance_{shot_id}',
                     f'{shot_id}_appearance', version, [],
-                    {'shot': spec, 'frame_plan': global_plan,
+                    {'shot': spec, 'frame_plan': global_plan, 'visual_review_extra_body': review_options,
                      'verification_scope': '只核对当前镜头在实际编码成片中的体积、空间纵深、绘画质感与光影稳定性。'
                          'frame_index 为成片全局帧号；图像证据必须来自当前镜头。'
                          '若失败，repair.shot_ids 仅列当前 shot.shot_id，保留已通过的剧情和其他镜头。'},
-                    drawing.image_inputs(evidence), [frame for frame, _ in evidence], visual_scope='temporal')
+                    drawing.image_inputs(evidence), [frame for frame, _ in evidence], visual_scope='temporal',
+                    extra_body=review_options)
             except Rejected as failure:
                 # 当前证据只来自一个已知镜头；不允许模型误指另一个有效镜头。
                 report = dict(failure.report)
@@ -211,18 +240,26 @@ def final_check(project, facts, board, shots):
         for event in facts['events']:
             relevant = [shot for shot in board['shots'] if event['event_id'] in shot['event_ids']]
             relevant_ids = {shot['shot_id'] for shot in relevant}
+            relative_ids = sorted(relevant_ids & relative_shots.keys())
+            motion_context = ({'relative_motion_reference': temporal.relative_motion_policy(),
+                               'relative_motion_reference_shot_ids': relative_ids} if relative_ids else {})
             evidence = [(frame, path) for frame, path in images
                         if any(shot['start_frame'] <= frame < shot['end_frame'] for shot in relevant)]
             report = review(project, directory, f'event_{event["event_id"]}', event['event_id'], version,
                             [req(event['event_id'], event['must_show'])],
                             {'original_story': config['story'], 'event': event,
-                             'shots': relevant, 'independent_observations': observations,
+                             'shots': relevant, **motion_context,
+                             'final_evidence_protocol': FINAL_EVIDENCE_PROTOCOL,
+                             'visual_review_extra_body': review_options,
+                             'pixel_evidence_role': '附图是编码成片按全局帧号解码的实际画面。'
+                                 '事件文字与帧计划仅定义要求，不能代替画面证明动作发生。'
+                                 '只依据所附实际像素核对事件、动作顺序和结果；证据不足时用 UNCERTAIN。',
                              'frame_plan': {'keyframes': [
                                  dict(key, frame_id=f'{rendered["shot_id"]}_{key["frame_id"]}',
                                       frame_index=key['frame_index'] + rendered['start_frame'])
                                  for rendered in shots if rendered['shot_id'] in relevant_ids
                                  for key in rendered['frame_plan']['keyframes']]}},
-                            drawing.image_inputs(evidence), [frame for frame, _ in evidence])
+                            drawing.image_inputs(evidence), [frame for frame, _ in evidence], extra_body=review_options)
             frames = report['checks'][0]['evidence_frames']
             coverage[event['event_id']] = {'frame_range': [min(frames), max(frames) + 1],
                                            'evidence_frames': frames, 'report': report}
@@ -234,15 +271,19 @@ def final_check(project, facts, board, shots):
         write_json(directory / 'event_evidence.json', coverage)
         return {'video': drawing.relative(project, video), 'status': 'PASS', 'coverage': coverage,
                 'appearance': appearance}
-    return project.task('exports/final', {'story': facts, 'storyboard': board}, deps, action,
+    return project.task('exports/final', {'story': facts, 'storyboard': board,
+                        'final_evidence_protocol': FINAL_EVIDENCE_PROTOCOL,
+                        **({'relative_motion_references': relative_shots} if relative_shots else {}),
+                        'visual_review_extra_body': review_options}, deps, action,
                         max_attempts=3, retry=False)
 
 
 def generate(story, out, seconds, fps, resume=False, max_calls=120, max_seconds=3600,
-             task_attempt_limits=None):
+             task_attempt_limits=None, review_strictness=None, render_consistency=None):
     config = {'pipeline': 'staged-canvas-v1', 'story': story, 'seconds': seconds, 'fps': fps,
               'width': WIDTH, 'height': HEIGHT, 'audio': False, 'style': '2D Canvas finite animation'}
-    with Project(out, config, resume, max_calls, max_seconds, task_attempt_limits) as project:
+    with Project(out, config, resume, max_calls, max_seconds, task_attempt_limits,
+                 review_strictness=review_strictness, render_consistency=render_consistency) as project:
         log('规划', '先审核故事、视觉设定与分镜，再开始绘制')
         facts, visual, board = planning.plan(project)
         references = drawing.assets(project, facts, visual)

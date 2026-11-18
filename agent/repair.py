@@ -2,7 +2,7 @@
 import re
 import difflib
 import json
-from . import model, rendering, validation
+from . import consistency, model, rendering, validation
 from .common import file_hash, read_json, write_json
 
 
@@ -25,11 +25,19 @@ def history(project, task_id, previous):
     for candidate in project.data['tasks'][task_id]['attempts']:
         if candidate['version'] > previous['version'] or not candidate.get('report'):
             continue
+        if task_id.startswith('segments/') and not same_review_policy(project, candidate):
+            continue
         report = candidate['report']
         records.append({'version': candidate['version'], 'target': report.get('target_id'),
                         'error': report.get('error'), 'checks': report.get('checks', []),
                         'repair': report.get('repair', {})})
     return records[-6:]
+
+
+def same_review_policy(project, candidate):
+    """旧无字段审核属于 strict；跨语义策略的结论只存历史，不变成当前修复约束。"""
+    current = consistency.review_policy(getattr(project, 'review_strictness', 'strict'))
+    return candidate.get('review_policy', consistency.review_policy('strict')) == current
 
 
 def evidence(project, directory, reports):
@@ -267,7 +275,7 @@ def regression_context(project, spec, plan, previous, current_html):
     if key is None:
         return None
     for candidate in reversed(project.data['tasks'][f'segments/{spec["shot_id"]}']['attempts']):
-        if candidate['version'] >= previous['version']:
+        if candidate['version'] >= previous['version'] or not same_review_policy(project, candidate):
             continue
         directory = project.root / candidate['path']
         source, check = directory / 'scene.html', directory / f'check_{key["frame_id"]}.json'
@@ -303,7 +311,15 @@ def patch_context(project, directory, spec, frames, previous):
         return None, frames, {}
     old_directory = project.root / base['path']
     plan_path = old_directory / 'frame_tasks.json'
-    plan = read_json(plan_path)['frame_plan'] if plan_path.exists() else frames
+    saved = read_json(plan_path) if plan_path.exists() else {}
+    old_versions = saved.get('input_versions', {})
+    current_versions = project.data['tasks'][f'segments/{spec["shot_id"]}'].get('input_versions', {})
+    plan_dependencies = ['plans/storyboard', f'plans/frames/{spec["shot_id"]}']
+    # 旧记录没有依赖元数据时保持原行为；明确的依赖变化必须使用最新已批准帧计划。
+    changed = {key: {'previous': old_versions[key], 'current': current_versions[key]}
+               for key in plan_dependencies if key in old_versions and key in current_versions
+               and old_versions[key] != current_versions[key]}
+    plan = frames if changed else saved.get('frame_plan', frames)
     validation.frame_plan(plan, spec)
     html = old_directory / 'scene.html'
     context = {'base_version': base['version'], 'base_html': str(html.relative_to(project.root)),
@@ -327,8 +343,18 @@ def patch_context(project, directory, spec, frames, previous):
         '不能把所有机械背景一起淡出。检查叠加透明度、暗角、遮挡及相机缩放后的屏幕位置，'
         '避免代码有图形但实际出画或不可见。后拉应扩大取景并显露中近景，同时保留首帧远景，'
         '不能通过删除首帧背景来制造展开效果。')
-    regression = regression_context(project, spec, plan, previous, html)
-    if regression:
-        context['regression'] = regression
+    if changed:
+        context['updated_plan'] = {
+            'source': 'latest_approved_frame_plan_argument',
+            'frame_plan_task': f'plans/frames/{spec["shot_id"]}',
+            'previous_frame_tasks': str(plan_path.relative_to(project.root)),
+            'changed_dependencies': changed}
+        context['instruction'] += ('已批准的分镜或帧计划依赖已更新：使用本次传入的最新已批准帧计划，'
+            '保留旧 HTML 作为修复基础。历史反馈仅在与新计划一致时适用；'
+            '不要恢复已失效计划的状态、约束或历史回退内容。仍须按当前全部要求完整审核。')
+    else:
+        regression = regression_context(project, spec, plan, previous, html)
+        if regression:
+            context['regression'] = regression
     write_json(directory / 'repair_strategy.json', context)
     return html, plan, context

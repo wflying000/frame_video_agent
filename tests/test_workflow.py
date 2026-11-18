@@ -161,7 +161,9 @@ class ValidationTests(unittest.TestCase):
                         payload = json.loads(ask.call_args.args[0][1]['content'][0]['text'])
                         self.assertEqual(payload['requirements'], REQ)
                         self.assertEqual(payload['required_check_ids'], ['R01'])
-                        self.assertEqual(payload['detail_confirmation']['initial_report']['status'], 'FAIL')
+                        self.assertNotIn('initial_report', payload['detail_confirmation'])
+                        self.assertEqual(payload['pixel_review_protocol'], 'blind_detail_v2')
+                        self.assertEqual(payload['detail_confirmation']['protocol'], 'blind_detail_v2')
                         self.assertEqual(read_json(folder / 'check_K01.json')['status'], 'FAIL')
                         self.assertEqual(read_json(folder / 'check_K01_resolution.json')['status'], status)
                         if status == 'PASS':
@@ -563,7 +565,7 @@ class WorkflowTests(unittest.TestCase):
         rows = []
         for i, frame in enumerate(indices):
             name = f'preview_{i:02d}.png'
-            (out / name).write_bytes(b'actual-png-placeholder')
+            (out / name).write_bytes(bytes.fromhex('89504e470d0a1a0a0000000d494844520000000200000002080600000072b60d240000001149444154789c63105030f80fc20c3006002bb4057d5db26f420000000049454e44ae426082'))
             rows.append({'frame_index': frame, 'path': name})
         write_json(out / 'preview_manifest.json', rows)
         if not preview:
@@ -599,7 +601,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(len(manifest['tasks']['segments/S02']['attempts']), 2)
             before = file_hash(result)
             temporal = [payload for _, payload in fake.calls
-                        if payload.get('target_id') == 'S01' and 'next_shot_entry' in payload][0]
+                        if payload.get('target_id') == 'S01' and payload.get('temporal_review_stage') == 'global'][0]
             self.assertEqual(temporal['next_shot_entry']['shot_id'], 'S02')
             self.assertIn('checks/timeline', temporal['verification_scope'])
             boundary = next(payload for _, payload in fake.calls if payload.get('target_id') == 'S01_S02')

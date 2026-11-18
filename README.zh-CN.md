@@ -146,8 +146,14 @@ LLM_EXTRA_BODY='{"thinking":{"type":"disabled"}}'
 | `LLM_EXTRA_BODY` | JSON 对象，合并进请求体，可覆盖 `max_tokens`、`stream` 等参数；服务专用字段须按实际支持情况填写 |
 | `LLM_IDLE_TIMEOUT_SECONDS` | 连续无新增正文或思考文本的超时秒数，默认 `180`，必须是有限正数 |
 | `LLM_SHOW_OUTPUT` | 设为 `1` 时实时显示完整模型正文，等价于 CLI 的 `--show-model-output` |
+| `VIDEO_REVIEW_STRICTNESS` | 生成时的视觉一致性档位：`strict`、`balanced`、`relaxed`，新项目默认 `balanced` |
+| `VIDEO_RENDER_CONSISTENCY` | 生成时的像素重画检查：`exact`（默认）或 `tolerant` |
 
 程序默认发送 `temperature=0.2`、`max_tokens=12000`、`response_format={"type":"json_object"}`、`stream=true`。切换服务时，如果不支持模板中的 `thinking` 字段，可将 `LLM_EXTRA_BODY` 改为 `'{}'`；不支持流式时可配置 `'{"stream":false}'`。若输出被截断，应在服务允许范围内调整 `max_tokens` 或思考设置。
+
+使用官方 `api.deepseek.com` 端点时，镜头关键帧、时序、镜头边界及成片图像审核会单独启用 `thinking=enabled`、`reasoning_effort=high`。逐次覆盖参数会写入任务输入、调用记录及缓存签名，并保留已配置的输出 token 上限。规划、资产审核、独立观察及纯故事汇总仍使用 `LLM_EXTRA_BODY`；其他兼容服务不会被自动加入 DeepSeek 专有参数。
+
+时序审核用重叠窗口覆盖全部实际采样帧，补充窗口首尾真实画面对照，再按原始要求审核完整镜头。成片动作证据从实际编码视频解码提取，包含动作中间帧。所有必需审核通过后才发布 `final.mp4`。
 
 `.env` 始终位于项目根目录，不放进 `agent/`。已有进程环境变量优先于 `.env`；纯渲染子进程不读取 `.env`。真实密钥及本地生成产物已在 `.gitignore` 中排除。
 
@@ -224,6 +230,8 @@ python -m agent generate examples/story.txt \
 | `--seconds` | `20` | 整数秒，范围 `2～120` |
 | `--fps` | `24` | 整数帧率，范围 `1～60` |
 | `--resume` | 关闭 | 仅用于 `generate`，恢复已有任务 |
+| `--review-strictness` | 新项目为 `balanced` | 视觉一致性：`strict`、`balanced`、`relaxed`，仅用于生成；恢复时默认继承已保存档位 |
+| `--render-consistency` | `exact` | 像素重画检查：`exact` 或 `tolerant`，可用于生成和离线渲染 |
 | `--max-calls` | `120` | 整个项目累计模型调用上限，必须大于 0 |
 | `--max-seconds` | `3600` | 累计活动耗时上限，必须大于 0，并非严格的墙钟计时截止时间 |
 | `--task-attempt-limit TASK=COUNT` | 按任务类型 | 仅用于 `generate --resume`，提高指定任务的累计候选上限，可重复指定 |
@@ -231,6 +239,38 @@ python -m agent generate examples/story.txt \
 | `--preview` | 关闭 | 仅用于 `render`，只生成采样 PNG，不输出 MP4 |
 
 分辨率固定为 1280×720，当前没有宽高 CLI 参数。视频生成失败或暂停时进程返回非零状态；详细原因见终端、`manifest.json` 和候选目录中的审核记录。
+
+### 3.5 配置一致性检查
+
+视觉审核与像素重画检查分别配置：
+
+| 视觉档位 | 验收标准 |
+| --- | --- |
+| `strict` | 严格核对计划中的姿态、位置、动作相位、时间和光影连续性。 |
+| `balanced`（默认） | 剧情与动作仍清楚时，允许轻微姿态、布局、比例、相位和时间偏差。 |
+| `relaxed` | 优先保证事件可读、角色可辨和动作结果明确，允许较大的非关键布局、节奏及局部光影差异。 |
+
+所有档位仍检查必需剧情、身份、关键连接、实际动作、体积感与空间纵深。明显断裂、主体消失和动作缺失仍会失败。切换档位会按新标准重新审核实际画面，不会把旧的 FAIL 或 UNCERTAIN 自动改成 PASS。
+
+```bash
+# 新项目使用平衡档
+python -m agent generate story_sea.txt \
+  --out outputs/sea_story --seconds 20 --fps 24 \
+  --review-strictness balanced
+
+# 已有项目切换档位，复验现有动画
+python -m agent generate story_sea.txt \
+  --out outputs/sea_story --seconds 20 --fps 24 --resume \
+  --review-strictness balanced
+
+# 离线渲染，容忍极小的像素栅格化差异
+python -m agent render animation.html --out outputs/render_preview \
+  --preview --render-consistency tolerant
+```
+
+命令行参数优先于生成时的环境配置。两者均未提供时，续跑继承保存的设置；没有这些字段的历史项目保留 `strict` / `exact`，直到明确切换。档位变化和受影响任务会记录在 manifest 中，现有动画源码保留用于复验，候选次数、模型调用和耗时预算继续累计。已达到候选上限时，按上文方法显式增加对应任务上限。
+
+像素模式 `exact` 要求同一时刻重画得到逐字节一致的 PNG。`tolerant` 只允许极小栅格化差异：RGBA 单通道最大差不超过 8/255，平均绝对通道差不超过 0.02（按 0～255 标度），任一通道差超过 2 的像素比例不超过 0.1%；三个条件必须同时通过。测量值与来源哈希保存在 `render_consistency.json`。两种模式都保留尺寸、解码、帧率、时长和黑帧检查，不提供跳过检查的模式。
 
 ## 4. 生成流程
 

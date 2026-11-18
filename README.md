@@ -146,8 +146,14 @@ Replace `LLM_API_KEY` with your own key and configure `LLM_BASE_URL`, `LLM_MODEL
 | `LLM_EXTRA_BODY` | A JSON object merged into the request body. It can override parameters such as `max_tokens` and `stream`; provider-specific fields must be supported by your service. |
 | `LLM_IDLE_TIMEOUT_SECONDS` | Timeout without new content or reasoning text, in seconds. Defaults to `180`; must be a finite positive number. |
 | `LLM_SHOW_OUTPUT` | Set to `1` to stream the complete model response to the terminal, equivalent to `--show-model-output`. |
+| `VIDEO_REVIEW_STRICTNESS` | Visual consistency profile for generation: `strict`, `balanced` or `relaxed`. New projects default to `balanced`. |
+| `VIDEO_RENDER_CONSISTENCY` | Pixel repeatability mode for generation: `exact` (default) or `tolerant`. |
 
 Default request parameters are `temperature=0.2`, `max_tokens=12000`, `response_format={"type":"json_object"}`, and `stream=true`. If another provider does not support the template's `thinking` field, set `LLM_EXTRA_BODY` to `'{}'`. If streaming is unsupported, use `'{"stream":false}'`. For truncated output, adjust `max_tokens` or reasoning settings within your provider's limits.
+
+For the official `api.deepseek.com` endpoint, shot keyframe, temporal, shot-boundary and final image reviews explicitly use `thinking=enabled` with `reasoning_effort=high`. These per-call overrides are recorded in task inputs, call metadata, and cache signatures; the configured token limit is retained. Planning, asset reviews, observations, and story-only checks continue to use `LLM_EXTRA_BODY`. Other compatible endpoints receive no automatic DeepSeek-specific overrides.
+
+Temporal review covers every sampled frame in overlapping windows, adds actual first/last-frame comparisons, and then checks the complete shot against its original requirements. Final action evidence is decoded from the encoded video, including intermediate motion frames. Every required review must pass before `final.mp4` is published.
 
 Keep `.env` in the project root, not inside `agent/`. Existing process environment variables take precedence over `.env`. Rendering-only subprocesses do not read `.env`. Real keys and local generation outputs are excluded by `.gitignore`.
 
@@ -224,6 +230,8 @@ python -m agent generate examples/story.txt \
 | `--seconds` | `20` | Integer duration in seconds, from `2` to `120`. |
 | `--fps` | `24` | Integer frame rate, from `1` to `60`. |
 | `--resume` | Off | Resume an existing task; available only for `generate`. |
+| `--review-strictness` | `balanced` for new projects | Visual consistency profile: `strict`, `balanced`, `relaxed`; generation only. Resume inherits the saved profile unless overridden. |
+| `--render-consistency` | `exact` | Pixel repeatability: `exact` or `tolerant`; available for generation and offline rendering. |
 | `--max-calls` | `120` | Cumulative model-call limit for the entire project; must be positive. |
 | `--max-seconds` | `3600` | Cumulative active-time limit; must be positive. It is not a strict wall-clock deadline. |
 | `--task-attempt-limit TASK=COUNT` | Per task type | Increase a task's cumulative candidate limit; only for `generate --resume`. May be repeated. |
@@ -231,6 +239,38 @@ python -m agent generate examples/story.txt \
 | `--preview` | Off | Generate sampled PNG previews without encoding an MP4; only for `render`. |
 
 Resolution is fixed at 1280×720; there are currently no width or height CLI options. A failed or paused generation exits with a nonzero status. See the terminal, `manifest.json`, and candidate review records for details.
+
+### 3.5 Configure consistency checks
+
+Visual review and pixel repeatability are configured separately:
+
+| Visual profile | Acceptance standard |
+| --- | --- |
+| `strict` | Closely follow the planned pose, position, phase, timing and lighting continuity. |
+| `balanced` (default) | Tolerate small pose, layout, proportion, phase and timing differences when the story and motion remain clear. |
+| `relaxed` | Prioritize readable events, recognizable characters and clear action results; allow larger nonessential layout, rhythm and local lighting differences. |
+
+Every profile still checks required story events, identity, important connections, visible action, volume and spatial depth. Obvious breaks, disappearing subjects and missing actions remain failures. A change in profile does not convert a previous FAIL or UNCERTAIN into PASS; the model reviews the actual frames again using the selected standard.
+
+```bash
+# New project using balanced visual review
+python -m agent generate story_sea.txt \
+  --out outputs/sea_story --seconds 20 --fps 24 \
+  --review-strictness balanced
+
+# Change an existing project's review profile and recheck its current animation
+python -m agent generate story_sea.txt \
+  --out outputs/sea_story --seconds 20 --fps 24 --resume \
+  --review-strictness balanced
+
+# Offline rendering with conservative pixel tolerance
+python -m agent render animation.html --out outputs/render_preview \
+  --preview --render-consistency tolerant
+```
+
+CLI settings override the generation environment settings. When neither is supplied, resume inherits the saved settings; legacy projects without these fields retain `strict` / `exact` until explicitly changed. Profile changes and their affected tasks are recorded in the manifest. Existing animation source is retained for recheck, and candidates, model calls and elapsed budgets continue accumulating. Increase a reached task limit explicitly as described above.
+
+Pixel mode `exact` requires byte-identical PNGs when the same time is rendered again. Mode `tolerant` permits only very small rasterization differences: maximum RGBA channel difference ≤ 8/255, mean absolute channel difference ≤ 0.02 on the 0–255 scale, and at most 0.1% of pixels with any channel difference above 2. All thresholds must pass. Measurements and source hashes are saved in `render_consistency.json`. Dimension, decoding, frame-rate, duration and black-frame checks remain in force in both modes; rendering has no unchecked mode.
 
 ## 4. Generation Workflow
 

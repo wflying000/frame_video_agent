@@ -4,12 +4,14 @@ import os
 from pathlib import Path
 import shutil
 import sys
+from dotenv import dotenv_values
 
 # 同时支持 python agent/video_agent.py 和 python -m agent。
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent import rendering
+from agent import consistency, rendering
+from agent.common import PROJECT_ROOT
 from agent.workflow import generate
 from agent.store import Blocked
 
@@ -33,6 +35,10 @@ def main():
     parser.add_argument('--max-seconds', type=int, default=3600, help='项目累计活动耗时上限，恢复时不清零')
     parser.add_argument('--task-attempt-limit', type=task_attempt_limit, action='append', default=[],
                         metavar='TASK=COUNT', help='恢复时设置指定任务的总候选上限，可重复指定；历史候选保留')
+    parser.add_argument('--review-strictness', choices=consistency.REVIEW_LEVELS,
+                        help='视觉一致性审核严格度；新项目默认 balanced，恢复时继承已保存设置')
+    parser.add_argument('--render-consistency', choices=consistency.RENDER_MODES,
+                        help='重画/重新加载像素一致性；默认 exact，tolerant 仅容忍微小像素误差')
     parser.add_argument('--preview', action='store_true', help='render 仅生成采样预览')
     parser.add_argument('--show-model-output', action='store_true', help='实时打印完整模型 JSON/代码')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
@@ -45,6 +51,8 @@ def main():
         parser.error('--preview/--worker/--frames/--samples 仅用于 render 模式。')
     if args.mode == 'render' and args.resume:
         parser.error('--resume 仅用于 generate 模式。')
+    if args.mode == 'render' and args.review_strictness is not None:
+        parser.error('--review-strictness 仅用于 generate 模式。')
     if args.task_attempt_limit and (args.mode != 'generate' or not args.resume):
         parser.error('--task-attempt-limit 必须用于 generate --resume。')
     if not 2 <= args.seconds <= 120 or not 1 <= args.fps <= 60:
@@ -61,9 +69,22 @@ def main():
         parser.error('输入文件不能为空。')
     out = args.out.resolve()
     if args.mode == 'generate':
+        # 只读取本阶段需要的配置值，不向环境注入 .env；render 子进程不能加载密钥。
+        names = ('VIDEO_REVIEW_STRICTNESS', 'VIDEO_RENDER_CONSISTENCY')
+        configured = {key: value for key, value in dotenv_values(PROJECT_ROOT / '.env').items()
+                      if key in names and value is not None}
+        review = args.review_strictness if args.review_strictness is not None else os.environ.get(
+            names[0], configured.get(names[0]))
+        render = args.render_consistency if args.render_consistency is not None else os.environ.get(
+            names[1], configured.get(names[1]))
+        if review is not None and review not in consistency.REVIEW_LEVELS:
+            parser.error('VIDEO_REVIEW_STRICTNESS 必须是 strict、balanced 或 relaxed。')
+        if render is not None and render not in consistency.RENDER_MODES:
+            parser.error('VIDEO_RENDER_CONSISTENCY 必须是 exact 或 tolerant。')
         try:
             print(generate(text, out, args.seconds, args.fps, args.resume, args.max_calls, args.max_seconds,
-                           dict(args.task_attempt_limit)))
+                           dict(args.task_attempt_limit), review_strictness=review,
+                           render_consistency=render))
         except Blocked as error:
             parser.exit(1, f'生成暂停：{error}\n')
         return
@@ -72,7 +93,11 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     indices = [int(item) for item in args.samples.split(',')] if args.samples else None
     worker = rendering.render if args.worker else rendering.render_job
-    worker(source, out, args.seconds, args.fps, args.preview, args.frames, indices)
+    render = args.render_consistency if args.render_consistency is not None else os.environ.get(
+        'VIDEO_RENDER_CONSISTENCY', 'exact')
+    if render not in consistency.RENDER_MODES:
+        parser.error('VIDEO_RENDER_CONSISTENCY 必须是 exact 或 tolerant。')
+    worker(source, out, args.seconds, args.fps, args.preview, args.frames, indices, consistency=render)
     if not args.worker:
         print(out if args.preview else out / 'video.mp4')
 

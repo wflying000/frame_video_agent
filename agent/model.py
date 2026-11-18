@@ -2,12 +2,14 @@
 import base64
 from copy import deepcopy
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
 import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from .common import PROJECT_ROOT, digest, log, heartbeat, write_json
 
@@ -42,6 +44,54 @@ def save_response(directory, raw, **metadata):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'response.txt').write_text(redact(raw), encoding='utf-8')
     write_json(directory / 'response.json', metadata)
+
+
+
+def recover_review_json(raw):
+    """仅恢复完整审核主体过早闭合、repair属性仍在其外的唯一确定语法。"""
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('duplicate JSON key')
+            value[key] = item
+        return value
+
+    def invalid_constant(value):
+        raise ValueError('non-standard JSON constant')
+
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    try:
+        # 沿用原始诊断的密钥脱敏规则；无法保留原文哈希证据时不作恢复。
+        if raw != redact(raw):
+            return None
+        prefix, end = decoder.raw_decode(raw, len(raw) - len(raw.lstrip()))
+        if not isinstance(prefix, dict) or set(prefix) != {'target_id', 'target_version', 'status', 'checks'}:
+            return None
+        suffix = raw[end:].strip()
+        if not suffix.startswith(','):
+            return None
+        tail = decoder.decode('{' + suffix[1:])
+        if not isinstance(tail, dict) or set(tail) != {'repair'} or not isinstance(tail['repair'], dict):
+            return None
+        result = dict(prefix, repair=tail['repair'])
+        # 证明只移除了已定位的一个根对象结束括号，未重新解释或修正任何字段值。
+        if raw[end - 1] != '}' or decoder.decode(raw[:end - 1] + raw[end:]) != result:
+            return None
+        normalized = json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + '\n'
+        proof = {
+            'kind': 'review_repair_extra_closing_brace_v1',
+            'raw_sha256': hashlib.sha256(raw.encode('utf-8')).hexdigest(),
+            'normalized_sha256': hashlib.sha256(normalized.encode('utf-8')).hexdigest(),
+            'prefix_end': end, 'removed_offset': end - 1, 'removed_character': '}',
+            'offset_unit': 'unicode_code_points',
+            'transform': 'remove_one_root_closing_brace_before_repair_property',
+            'raw_file': 'response.txt', 'normalized_file': 'normalized_response.json',
+            'validation': 'syntax_only; semantic_review_validation_required',
+        }
+        return result, proof
+    except (ValueError, TypeError):
+        return None
 
 
 def retry_messages(messages, error):
@@ -149,18 +199,18 @@ def read_completion(response, state, show_output, idle_timeout=180):
     return {"finish_reason": finish, "message": {"content": "".join(parts)}}
 
 
-def ask(messages, *, diagnostics=None):
+def ask(messages, *, diagnostics=None, extra_body=None):
     """一个兼容 Chat Completions 的多模态模型同时负责编写与看图。"""
     # 仅在调用模型时加载，避免渲染子进程重新从 .env 读取已移除的密钥。
-    load_dotenv(PROJECT_ROOT / ".env", override=False)
+    effective = effective_settings(extra_body)
     key = os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
     if not key:
         raise ValueError("请在项目 .env 或环境变量中设置 LLM_API_KEY、DEEPSEEK_API_KEY 或 DASHSCOPE_API_KEY。")
-    base = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
-    body = {"model": os.getenv("LLM_MODEL", "deepseek-flash"), "messages": messages,
+    base = effective["base_url"]
+    body = {"model": effective["model"], "messages": messages,
             "temperature": 0.2, "max_tokens": 12000,
             "response_format": {"type": "json_object"}, "stream": True}
-    body.update(json.loads(os.getenv("LLM_EXTRA_BODY", '{}')))
+    body.update(effective['extra_body'])
     idle_timeout = float(os.getenv('LLM_IDLE_TIMEOUT_SECONDS', '180'))
     if not math.isfinite(idle_timeout) or idle_timeout <= 0:
         raise ValueError('LLM_IDLE_TIMEOUT_SECONDS 必须为有限正数')
@@ -204,6 +254,7 @@ def ask(messages, *, diagnostics=None):
         log("错误", detail)
         save_response(diagnostics, content, status='TRUNCATED', finish_reason='length', error=detail)
         raise ValueError(detail)
+    recovery = None
     try:
         if not content.strip():
             raise ResponseFormatError(content, finish_reason=choice.get('finish_reason'))
@@ -212,14 +263,25 @@ def ask(messages, *, diagnostics=None):
             raise ResponseFormatError(content, error=ValueError('顶层必须是 JSON 对象'),
                                       finish_reason=choice.get('finish_reason'))
     except json.JSONDecodeError as error:
-        failure = ResponseFormatError(content, error=error, finish_reason=choice.get('finish_reason'))
-        save_response(diagnostics, content, status='FORMAT_ERROR', **failure.details)
-        raise failure from error
+        from . import prompts
+        recovered = (recover_review_json(content) if messages and
+                     messages[0].get('role') == 'system' and messages[0].get('content') == prompts.REVIEW else None)
+        if recovered is None:
+            failure = ResponseFormatError(content, error=error, finish_reason=choice.get('finish_reason'))
+            save_response(diagnostics, content, status='FORMAT_ERROR', **failure.details)
+            raise failure from error
+        result, recovery = recovered
     except ResponseFormatError as error:
         save_response(diagnostics, content, status='FORMAT_ERROR', **error.details)
         raise
     save_response(diagnostics, content, status='PASS', finish_reason=choice.get('finish_reason'),
-                  characters=len(content))
+                  characters=len(content), **({'recovery': recovery} if recovery else {}))
+    if recovery:
+        if diagnostics is not None:
+            normalized = json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False) + '\n'
+            (Path(diagnostics) / 'normalized_response.json').write_text(normalized, encoding='utf-8')
+            write_json(Path(diagnostics) / 'recovery_proof.json', recovery)
+        log('格式', '审核JSON仅恢复repair前多余的结束括号，原状态与检查值不变，继续严格验收')
     log("模型", "JSON 解析成功")
     return result
 
@@ -231,10 +293,32 @@ def settings():
             'base_url': os.getenv('LLM_BASE_URL', 'https://api.deepseek.com'),
             'extra_body': json.loads(os.getenv('LLM_EXTRA_BODY', '{}'))}
 
+
+def effective_settings(extra_body=None):
+    """显式逐次选项覆盖默认参数；不修改环境或默认任务签名。"""
+    result = deepcopy(settings())
+    if extra_body is not None:
+        if not isinstance(extra_body, dict):
+            raise ValueError('per-call extra_body 必须是对象')
+        result['extra_body'].update(deepcopy(extra_body))
+    return result
+
+
+def visual_review_options():
+    """仅官方DeepSeek端点的复杂视觉验收启用推理；其他兼容服务不注入专有参数。"""
+    if urlparse(settings()['base_url']).hostname == 'api.deepseek.com':
+        return {'thinking': {'type': 'enabled'}, 'reasoning_effort': 'high'}
+    return {}
+
+
 def messages(system, payload, images=()):
     content = [{'type': 'text', 'text': json.dumps(payload, ensure_ascii=False)}]
     for label, path in images:
         content.append({'type': 'text', 'text': label})
-        encoded = base64.b64encode(Path(path).read_bytes()).decode()
-        content.append({'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}})
+        path = Path(path)
+        mime = 'image/jpeg' if path.suffix.lower() in {'.jpg', '.jpeg'} else 'image/png'
+        encoded = base64.b64encode(path.read_bytes()).decode()
+        if mime == 'image/jpeg':
+            content.append({'type': 'text', 'text': '实际帧JPEG传输副本，原分辨率保留；非新帧，帧号仍以上方原始标签为准。'})
+        content.append({'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,' + encoded}})
     return [{'role': 'system', 'content': system}, {'role': 'user', 'content': content}]

@@ -1,7 +1,7 @@
 """规划阶段：解析与审核分离，先通过结构检查再进行语义验收。"""
 from copy import deepcopy
 import json
-from . import model, prompts, validation
+from . import consistency, model, prompts, rendering, validation
 from .common import digest, file_hash, log, read_json, write_json
 from .store import Rejected
 
@@ -57,7 +57,7 @@ def validate_review_evidence(report, frame_ids, context):
                                    '光影与体积稳定性 PASS 必须比较实际非黑屏帧')
 
 
-def reuse_review(project, directory, name, messages, target, version, requirements, frame_ids):
+def reuse_review(project, directory, name, messages, target, version, requirements, frame_ids, extra_body=None):
     """只复用相同要求、真实像素与配置的 PASS，显式绑定原审核证据。"""
     def signature(recorded):
         recorded = deepcopy(recorded)
@@ -67,7 +67,7 @@ def reuse_review(project, directory, name, messages, target, version, requiremen
         return digest(recorded)
     recorded = model.recorded_messages(messages)
     evidence_context = json.loads(recorded[1]['content'][0]['text'])
-    expected, settings = signature(recorded), model.settings()
+    expected, settings = signature(recorded), model.effective_settings(extra_body)
     for prior_dir in sorted(directory.parent.glob('v*'), reverse=True):
         if prior_dir == directory:
             continue
@@ -89,7 +89,9 @@ def reuse_review(project, directory, name, messages, target, version, requiremen
             if not all(path.is_file() for path in (resolution, detail, detail_request, detail_call)):
                 continue
             proof = read_json(resolution)
-            if proof.get('status') != 'PASS' or read_json(detail_call).get('model') != settings:
+            if (proof.get('status') != 'PASS' or
+                    proof.get('review_protocol') != evidence_context.get('pixel_review_protocol') or
+                    read_json(detail_call).get('model') != settings):
                 continue
             detailed = read_json(detail_request)
             base_context = json.loads(detailed[1]['content'][0]['text'])
@@ -127,7 +129,8 @@ def reuse_review(project, directory, name, messages, target, version, requiremen
 
 
 def review(project, directory, name, target, version, requirements, payload, images=(), frame_ids=None,
-           mode=None, visual_scope=None):
+           mode=None, visual_scope=None, extra_body=None):
+    images = rendering.compact_review_images(directory / (name + '_transport'), images)
     depth_frames = None
     if visual_scope is not None and frame_ids is not None:
         black_ranges = payload.get('allowed_black_ranges', payload.get('frame_plan', {}).get('allowed_black_ranges', []))
@@ -156,7 +159,11 @@ def review(project, directory, name, target, version, requirements, payload, ima
     context = dict(payload, target_id=target, target_version=version, requirements=requirements,
                    required_check_ids=[r['id'] for r in requirements],
                    evidence_mode=mode or ('pixels' if images else 'plan'))
+    if images and context['evidence_mode'] == 'pixels' and visual_scope not in ('plan', 'reference'):
+        context['consistency_policy'] = consistency.review_policy(getattr(project, 'review_strictness', 'strict'))
     if frame_ids is not None:
+        # 协议属于请求证据，旧有带结论复核不能跨协议复用。
+        context['pixel_review_protocol'] = 'blind_detail_v2'
         if payload.get('frame_plan'):
             context['spatial_coordinate_reference'] = {
                 'version': 1,
@@ -174,7 +181,7 @@ def review(project, directory, name, target, version, requirements, payload, ima
         # 旧版未记录 pixel_scope 的审核也不能绕过新增的方向参照规则。
         if policy is None:
             reused = reuse_review(project, directory, name, model.messages(prompts.REVIEW, context, images),
-                                  target, version, requirements, frame_ids)
+                                  target, version, requirements, frame_ids, extra_body=extra_body)
             if reused:
                 return reused
         # 关键帧检查经常涉及几十像素的小接触区；提供实际局部图，避免从全景估计精确坐标。
@@ -196,28 +203,32 @@ def review(project, directory, name, target, version, requirements, payload, ima
             if policy:
                 context['pixel_scope']['motion_comparison'] = policy
         reused = reuse_review(project, directory, name, model.messages(prompts.REVIEW, context, images),
-                              target, version, requirements, frame_ids)
+                              target, version, requirements, frame_ids, extra_body=extra_body)
         if reused:
             return reused
     report, passed = checked_review(project, directory, name, target, version, requirements,
-                                    context, images, frame_ids)
+                                    context, images, frame_ids, extra_body=extra_body)
     if not passed and frame_ids is not None and len(frame_ids) <= 2:
         from .repair import review_details
-        details = review_details(directory / (name + '_detail_evidence'), report, images, frame_ids)
+        details = [(label.replace('失败区域复核：', '区域细节：', 1), path)
+                   for label, path in review_details(
+                       directory / (name + '_detail_evidence'), report, images, frame_ids)]
         if details:
             # 增加此前没有的区域细节后只复核一次，不能重复抽样直到 PASS。
             initial = directory / (name + '_initial_result.json')
             write_json(initial, report)
+            # 初审判断和修复建议仅留在本地溯源文件；复核从原要求和像素独立判断。
             context = dict(context, detail_confirmation={
-                'initial_report': report,
-                'instruction': '依据新增的失败区域真实放大图和原始全图复核。'
-                    '首次报告可能正确也可能误读，必须重新核对全部 required_check_ids。'
-                    '不要把第一次判断当作事实，不降低要求；仍看不清则 UNCERTAIN。'})
+                'protocol': 'blind_detail_v2',
+                'instruction': '依据原始全图和同一帧真实像素的区域放大图独立审核。'
+                    '必须逐项核对全部 required_check_ids，不能只审局部或省略原要求。'
+                    '局部图不代表额外帧，也不能代替全图的状态与空间证据；看不清则 UNCERTAIN。'})
             images = list(images) + details
             log('复核', f'{target} 增加真实区域细节，最多复核一次')
             report, passed = checked_review(project, directory, name + '_detail', target, version,
-                                            requirements, context, images, frame_ids)
+                                            requirements, context, images, frame_ids, extra_body=extra_body)
             resolution = {
+                'review_protocol': 'blind_detail_v2',
                 'initial_report': initial.name, 'initial_hash': file_hash(initial),
                 'detail_report': name + '_detail.json', 'status': report['status'],
                 'detail_images': [{'label': label, 'path': str(path.resolve().relative_to(project.root)),
@@ -233,12 +244,13 @@ def review(project, directory, name, target, version, requirements, payload, ima
     return report
 
 
-def checked_review(project, directory, name, target, version, requirements, context, images, frame_ids):
+def checked_review(project, directory, name, target, version, requirements, context, images, frame_ids, extra_body=None):
     """只修复响应格式，不重试语义结论。"""
     context = dict(context)
     for attempt in range(2):
         call_name = name if attempt == 0 else name + '_format_retry'
-        report = project.call(directory, call_name, model.messages(prompts.REVIEW, context, images))
+        report = project.call(directory, call_name, model.messages(prompts.REVIEW, context, images),
+                              **({'extra_body': extra_body} if extra_body else {}))
         try:
             passed = validation.review(report, target, version, requirements)
             if frame_ids is not None:

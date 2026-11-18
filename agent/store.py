@@ -1,5 +1,7 @@
 """单进程任务调度：原子检查点、内容哈希、依赖失效及持久化预算。"""
 from contextlib import contextmanager
+from copy import deepcopy
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -7,7 +9,7 @@ import subprocess
 import time
 from urllib.error import HTTPError, URLError
 
-from . import model, prompts
+from . import consistency, model, prompts
 from .common import digest, file_hash, log, read_json, write_json
 from .rendering import RenderError
 
@@ -24,12 +26,18 @@ class Rejected(RuntimeError):
 
 class Project:
     def __init__(self, out, config, resume=False, max_calls=120, max_seconds=3600,
-                 task_attempt_limits=None):
+                 task_attempt_limits=None, review_strictness=None, render_consistency=None):
         self.root = Path(out).resolve()
         self.config = config
         self.resume = resume
         self.max_calls, self.max_seconds = max_calls, max_seconds
         self.task_attempt_limits = dict(task_attempt_limits or {})
+        if review_strictness is not None and review_strictness not in consistency.REVIEW_LEVELS:
+            raise ValueError('review_strictness 必须是 strict、balanced 或 relaxed')
+        if render_consistency is not None and render_consistency not in consistency.RENDER_MODES:
+            raise ValueError('render_consistency 必须是 exact 或 tolerant')
+        self.requested_review_strictness = review_strictness
+        self.requested_render_consistency = render_consistency
         if self.task_attempt_limits and not resume:
             raise ValueError('指定任务候选上限必须同时使用 --resume。')
         if any(type(limit) is not int or limit < 1 for limit in self.task_attempt_limits.values()):
@@ -76,6 +84,7 @@ class Project:
                              'repair_requests': {}, 'global_repairs': 0}
                 write_json(self.root / 'project_config.json', self.config)
                 (self.root / 'story.txt').write_text(self.config['story'], encoding='utf-8')
+            self.configure_consistency()
             self.data['limits'] = {'max_calls': self.max_calls, 'max_seconds': self.max_seconds,
                                    'task_attempt_limits': self.task_attempt_limits}
             self.data['status'] = 'RUNNING'
@@ -84,6 +93,93 @@ class Project:
         except BaseException:
             lock.unlink(missing_ok=True)
             raise
+
+    def configure_consistency(self):
+        """审核策略独立于内容配置；迁移保留所有候选、调用和预算历史。"""
+        legacy = self.resume and 'review_policy' not in self.data
+        saved_policy = self.data.get('review_policy', consistency.review_policy('strict'))
+        if not isinstance(saved_policy, dict) or saved_policy.get('name') not in consistency.REVIEW_LEVELS:
+            raise ValueError('manifest 中的 review_policy 无效')
+        saved_render = self.data.get('render_consistency', 'exact')
+        if saved_render not in consistency.RENDER_MODES:
+            raise ValueError('manifest 中的 render_consistency 无效')
+        self.review_strictness = self.requested_review_strictness or (
+            saved_policy['name'] if self.resume else 'balanced')
+        self.review_policy = consistency.review_policy(self.review_strictness)
+        self.render_consistency = self.requested_render_consistency or saved_render
+        review_changed = self.resume and self.review_policy != saved_policy
+        render_changed = self.resume and self.render_consistency != saved_render
+        # 已有 strict/exact 项目可继续命中原有签名；切换策略后不再使用此兼容路径。
+        self.data['legacy_policy_compat'] = bool(
+            self.data.get('legacy_policy_compat', legacy) and not (review_changed or render_changed))
+        self.data['legacy_review_compat'] = bool(
+            self.data.get('legacy_review_compat', legacy) and not review_changed)
+        self.data['legacy_render_compat'] = bool(
+            self.data.get('legacy_render_compat', legacy) and not render_changed)
+        self.data['review_policy'] = deepcopy(self.review_policy)
+        self.data['render_consistency'] = self.render_consistency
+        if not (review_changed or render_changed):
+            return
+        tasks = self.data['tasks']
+        roots = {key for key in tasks if
+                 (review_changed and consistency.affects_review(key)) or
+                 (render_changed and self.affects_render(key))}
+        affected = set(roots)
+        while True:
+            downstream = {key for key, node in tasks.items()
+                          if affected.intersection(node.get('depends_on', []))}
+            if downstream <= affected:
+                break
+            affected |= downstream
+        archived, preserved = {}, {}
+        requests = self.data.setdefault('repair_requests', {})
+        for task_id in sorted(affected):
+            if not task_id.startswith(('segments/', 'assets/')):
+                continue
+            target = task_id.split('/', 1)[1]
+            if target not in requests:
+                continue
+            feedback = requests.pop(target)
+            archived[target] = deepcopy(feedback)
+            pending = self.pending_local_repairs(task_id, feedback)
+            if pending:
+                requests[target] = pending
+                preserved[target] = deepcopy(pending)
+        for task_id in sorted(roots):
+            self.invalidate(task_id)
+        self.data.setdefault('policy_history', []).append({
+            'time': datetime.now(timezone.utc).isoformat(),
+            'from': {'review_policy': deepcopy(saved_policy), 'render_consistency': saved_render},
+            'to': {'review_policy': deepcopy(self.review_policy), 'render_consistency': self.render_consistency},
+            'affected': sorted(affected), 'repair_requests': archived,
+            'preserved_local_repairs': preserved})
+        log('配置', f'一致性策略：{self.review_strictness} / {self.render_consistency}；'
+                   '已保留原候选与预算，受影响结果需要重新审核')
+
+    @staticmethod
+    def affects_render(task_id):
+        return task_id.startswith(('assets/', 'segments/')) or consistency.affects_review(task_id)
+
+    def pending_local_repairs(self, task_id, feedback):
+        """迁移时只保留尚未应用的显式源码修改，旧审核失败指令进入历史。"""
+        if not isinstance(feedback, dict):
+            return {}
+        filename = 'scene.html' if task_id.startswith('segments/') else 'reference.html'
+        current_hash = None
+        for attempt in reversed(self.data['tasks'][task_id].get('attempts', [])):
+            source = self.root / attempt['path'] / filename
+            if source.is_file():
+                current_hash = file_hash(source)
+                break
+        pending = {}
+        source = feedback.get('local_source')
+        if source is not None and (not isinstance(source, dict) or source.get('hash') != current_hash):
+            pending['local_source'] = deepcopy(source)
+        patch = feedback.get('local_patch')
+        if patch is not None and (not isinstance(patch, dict) or current_hash is None or
+                                  patch.get('source_hash') == current_hash):
+            pending['local_patch'] = deepcopy(patch)
+        return pending
 
     def __exit__(self, kind, error, traceback):
         try:
@@ -139,10 +235,11 @@ class Project:
         self.data['status'] = 'RUNNING'
         log('依赖', '需要重建或复验：' + ', '.join(sorted(affected)))
 
-    def call(self, directory, name, messages):
+    def call(self, directory, name, messages, *, extra_body=None):
         """候选内的每次调用可独立恢复，不因审核网络错误重新生成代码。"""
         path = directory / f'{name}.json'
-        signature = digest({'messages': messages, 'settings': model.settings()})
+        effective = model.effective_settings(extra_body)
+        signature = digest({'messages': messages, 'settings': effective})
         cache = directory / f'{name}.call.json'
         if path.exists() and cache.exists():
             cached = read_json(cache)
@@ -157,20 +254,22 @@ class Project:
             write_json(directory / f'{name}.request.json', recorded)
             trace = directory / 'calls' / name / f'{self.data["calls"]:06d}'
             write_json(trace / 'request.json', recorded)
-            write_json(cache, {'input_hash': signature, 'model': model.settings(),
+            write_json(trace / 'settings.json', effective)
+            write_json(cache, {'input_hash': signature, 'model': effective,
                               'call_number': self.data['calls'], 'status': 'RUNNING'})
             self.checkpoint()
             try:
-                value = model.ask(request_messages, diagnostics=trace)
+                value = model.ask(request_messages, diagnostics=trace,
+                                  **({'extra_body': effective['extra_body']} if extra_body else {}))
                 write_json(path, value)
-                write_json(cache, {'input_hash': signature, 'model': model.settings(),
+                write_json(cache, {'input_hash': signature, 'model': effective,
                                   'call_number': self.data['calls'], 'status': 'PASS'})
                 return value
             except model.ResponseFormatError as error:
                 report = {'status': 'FORMAT_ERROR', 'kind': 'model_response_format',
                           'error': str(error), 'diagnostics': str(trace.relative_to(self.root)),
                           **error.details}
-                write_json(cache, {'input_hash': signature, 'model': model.settings(),
+                write_json(cache, {'input_hash': signature, 'model': effective,
                                   'call_number': self.data['calls'], **report})
                 log('格式', f'{name}：{error}；原始响应与位置见 {trace}')
                 if retry:
@@ -210,8 +309,13 @@ class Project:
                 raise Blocked(f'{task_id} 的依赖 {dep} 未通过')
         versions = {dep: {'version': self.data['tasks'][dep]['version'],
                           'output_hash': self.data['tasks'][dep]['output_hash']} for dep in deps}
-        signature = digest({'inputs': inputs, 'dependencies': versions, 'model': model.settings(),
-                            'prompts': {key: value for key, value in vars(prompts).items() if key.isupper()}})
+        signature_inputs = {'inputs': inputs, 'dependencies': versions, 'model': model.settings(),
+                            'prompts': {key: value for key, value in vars(prompts).items() if key.isupper()}}
+        if consistency.affects_review(task_id) and not self.data.get('legacy_review_compat'):
+            signature_inputs['review_policy'] = self.review_policy
+        if self.affects_render(task_id) and not self.data.get('legacy_render_compat'):
+            signature_inputs['render_consistency'] = self.render_consistency
+        signature = digest(signature_inputs)
         node = self.data['tasks'].setdefault(task_id, {'status': 'PENDING', 'attempts': [],
                                                      'depends_on': deps})
         if node['status'] == 'PASS' and node.get('input_hash') == signature and self.artifacts_valid(node):
@@ -234,7 +338,9 @@ class Project:
                                   ' 增加一个候选；历史次数和项目预算不清零。')
                 version = len(node['attempts']) + 1
                 candidate = {'version': version, 'input_hash': signature, 'status': 'RUNNING',
-                             'path': f'{task_id}/v{version:03d}'}
+                             'path': f'{task_id}/v{version:03d}',
+                             'review_policy': deepcopy(self.review_policy),
+                             'render_consistency': self.render_consistency}
                 node['attempts'].append(candidate)
             else:
                 candidate = previous
