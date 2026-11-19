@@ -19,11 +19,11 @@ These are default **hard review requirements**, added by the application even if
 
 Explicitly planned black transitions retain their original state and technical checks; they are exempt from appearance checks and cannot serve as depth evidence for visible scenes. Temporal appearance checks require multiple actual non-black frames when available. Final appearance failures are bound to the shot being reviewed, with the model's original report preserved.
 
-Generation commands are unchanged. Use a new output directory to regenerate a story under these rules. On `--resume`, changed prompts invalidate old task approvals and preserve version history and cumulative budgets; a stale published video is archived under `exports/previous_final_*.mp4`. Existing showcase files below were generated before this requirement and have not been regenerated or certified against it.
+Generation commands are unchanged. Use a new output directory to regenerate a story under these rules. On `--resume`, changed prompts invalidate old task approvals and preserve version history and cumulative budgets; a stale published video is archived under `exports/previous_final_*.mp4`. The showcase below now uses regenerated videos that passed these appearance checks with `balanced` consistency review and `exact` pixel repeatability.
 
 ## Video Showcase
 
-All four videos below completed this project's generation and final acceptance workflow. The README displays smaller animated GIF previews. Click a preview or **Full MP4** to open the original **1280×720, 24 fps video without audio**.
+All four videos below completed this project's generation and final acceptance workflow with `balanced` consistency review, including the volume and spatial-depth requirements. The README displays smaller animated GIF previews. Click a preview or **Full MP4** to open the original **1280×720, 24 fps video without audio**.
 
 | Mechanical Underwater World · 20 seconds | A Little Cloud's Rainbow Sneeze · 6 seconds |
 | --- | --- |
@@ -37,7 +37,7 @@ All four videos below completed this project's generation and final acceptance w
 | A red balloon carries a little star into the night sky. The star stops and gives a happy blink. | A chocolate chip cookie tiptoes away from its jar, then stops with a proud grin. |
 | [Full MP4](docs/showcase/balloon_star.mp4) · [Original story](examples/stories/balloon_star.txt) | [Full MP4](docs/showcase/cookie_escape.mp4) · [Original story](examples/stories/cookie_escape.txt) |
 
-The underwater video was copied from the existing `sea_video/final.mp4`; its SHA-256 matches the original accepted video. The three new stories are in `examples/stories/`. Video specifications, source paths, and acceptance status are recorded in [`docs/showcase/provenance.json`](docs/showcase/provenance.json). The original story files are in Chinese.
+The underwater showcase uses the newly accepted `outputs/sea_story_depth_20261117/final.mp4`. The other three videos were regenerated in `outputs/showcase_balanced_20261118/`; their stories are in `examples/stories/`. Each MP4 is an unchanged copy of its accepted export. Video and preview hashes, review profiles, source paths and accepted versions are recorded in [`docs/showcase/provenance.json`](docs/showcase/provenance.json). The original story files are in Chinese.
 
 <details>
 <summary>Commands to generate the three new stories</summary>
@@ -50,12 +50,13 @@ conda activate vagent
 for story in cloud_sneeze balloon_star cookie_escape; do
   LLM_EXTRA_BODY='{"thinking":{"type":"disabled"},"max_tokens":32768}' \
   python -m agent generate "examples/stories/${story}.txt" \
-    --out "outputs/showcase/${story}" --seconds 6 --fps 24 \
-    --max-calls 120 --max-seconds 3600
+    --out "outputs/showcase_balanced/${story}" --seconds 6 --fps 24 \
+    --review-strictness balanced --render-consistency exact \
+    --max-calls 270 --max-seconds 9000
 done
 ```
 
-These are the model settings used for the new examples. They do not modify the root `.env` file; adjust them to match your provider's supported parameters. A new output directory must be empty. To continue a paused story, use the same parameters and add `--resume`. Some shots in these examples required local code repairs and higher task-specific candidate limits before passing review; see `provenance.json` for repair records. Model output and repair counts can vary between runs, so regeneration does not guarantee identical pixels.
+The commands apply model settings to each run without modifying the root `.env` file. Adjust them to match your provider's supported parameters. For longer reasoning reviews, increase `max_tokens` within your provider's limits, for example to `65536`. A new output directory must be empty. To continue a paused story, use the same parameters and add `--resume`. Reviews may require local repairs or higher task-specific candidate limits; all required checks must still pass. See `provenance.json` for the accepted versions of these examples. Each run saves its own animation, candidates and review results.
 
 </details>
 

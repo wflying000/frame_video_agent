@@ -19,11 +19,11 @@
 
 计划明确声明的黑屏转场保留原状态与技术检查，不要求黑帧具有体积，也不能拿黑帧代替可见场景的纵深证据。时序美术审核在有多帧非黑画面时必须引用多帧实际证据。成片美术检查失败时，修复绑定到被审核的镜头，模型的原始报告仍会保留。
 
-生成指令不变。按新要求重新制作故事时，建议使用新的输出目录。对旧项目执行 `--resume` 时，提示词变化会使旧任务的通过状态失效，历史版本及累计预算保留；失效的旧成片会归档到 `exports/previous_final_*.mp4`。下方展示视频生成于新增要求之前，本次未重新生成，也未按新标准重新验收。
+生成指令不变。按新要求重新制作故事时，建议使用新的输出目录。对旧项目执行 `--resume` 时，提示词变化会使旧任务的通过状态失效，历史版本及累计预算保留；失效的旧成片会归档到 `exports/previous_final_*.mp4`。下方展示已替换为重新生成并通过上述美术检查的视频，使用 `balanced` 一致性审核和 `exact` 像素重画校验。
 
 ## 示例视频
 
-以下四段视频均经过本项目的生成与最终验收流程。README 中显示的是缩小后的 GIF 动态预览；点击预览图或「完整 MP4」可打开原始 **1280×720、24 fps、无音轨** 视频。
+以下四段视频均使用 `balanced` 一致性审核，通过本项目的生成与最终验收流程，包括体积感与空间纵深要求。README 中显示的是缩小后的 GIF 动态预览；点击预览图或「完整 MP4」可打开原始 **1280×720、24 fps、无音轨** 视频。
 
 | 机械海底世界 · 20 秒 | 小云的彩虹喷嚏 · 6 秒 |
 | --- | --- |
@@ -37,7 +37,7 @@
 | 红气球牵着小星星升向夜空，小星星停下来眨了眨眼。 | 长出小短腿的巧克力豆饼干，踮脚远离罐子，停下来得意地笑了。 |
 | [完整 MP4](docs/showcase/balloon_star.mp4) · [故事原文](examples/stories/balloon_star.txt) | [完整 MP4](docs/showcase/cookie_escape.mp4) · [故事原文](examples/stories/cookie_escape.txt) |
 
-海底视频来自已有的 `sea_video/final.mp4`，展示副本与原成片的 SHA-256 一致。三个新故事保存在 `examples/stories/`；视频规格、来源与验收状态记录在 [`docs/showcase/provenance.json`](docs/showcase/provenance.json)。
+海底展示使用新验收的 `outputs/sea_story_depth_20261117/final.mp4`，其余三个视频在 `outputs/showcase_balanced_20261118/` 重新生成，故事原文位于 `examples/stories/`。每个展示 MP4 均为正式验收成片的原样副本。视频和预览哈希、审核档位、来源及通过版本保存在 [`docs/showcase/provenance.json`](docs/showcase/provenance.json)。
 
 <details>
 <summary>复现三个新故事的生成命令</summary>
@@ -50,12 +50,13 @@ conda activate vagent
 for story in cloud_sneeze balloon_star cookie_escape; do
   LLM_EXTRA_BODY='{"thinking":{"type":"disabled"},"max_tokens":32768}' \
   python -m agent generate "examples/stories/${story}.txt" \
-    --out "outputs/showcase/${story}" --seconds 6 --fps 24 \
-    --max-calls 120 --max-seconds 3600
+    --out "outputs/showcase_balanced/${story}" --seconds 6 --fps 24 \
+    --review-strictness balanced --render-consistency exact \
+    --max-calls 270 --max-seconds 9000
 done
 ```
 
-上述模型参数是本次新示例使用的运行配置，不改写根目录 `.env`；其他服务请按实际支持情况调整。新输出目录须为空，暂停后对同一故事使用原参数追加 `--resume`。本次示例的部分镜头经局部代码修复并提高对应候选上限后重新通过审核，记录见 `provenance.json`。模型输出和修复次数可能随运行变化，复现不保证画面逐像素相同。
+上述命令为每次运行设置模型参数，保留根目录 `.env`。请按服务支持情况调整参数；较长的推理审核可在服务允许范围内提高 `max_tokens`，例如设为 `65536`。新输出目录须为空，暂停后对同一故事使用原参数追加 `--resume`。审核可能需要局部修复或提高对应候选上限，所有必需检查仍须通过；本次示例的通过版本见 `provenance.json`。每次运行都会保存独立的动画版本和审核结果。
 
 </details>
 
